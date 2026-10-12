@@ -1,0 +1,2 @@
+OLMo-core v3.0.0, https://github.com/allenai/OLMo-core
+Apache-2.0; see LICENSE. Vendored runtime, imported before site-packages.

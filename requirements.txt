@@ -1,0 +1,28 @@
+# Use the existing conda environment: conda activate olmo.
+# Keep the installed GPU stack unchanged.
+torch==2.9.1
+flash-attn==2.8.3; sys_platform == "linux"
+transformers==5.12.1
+tokenizers==0.22.2
+huggingface-hub>=1.5,<2
+flash-linear-attention==0.4.1; sys_platform == "linux"
+zstandard==0.25.0
+numpy>=1.26,<3
+einops==0.8.2
+# Runtime requirements of the vendored OLMo-core; no second OLMo installation.
+cached-path==1.8.10
+bettermap==1.3.1
+dataclass-extensions==0.5.0
+filelock>=3.20,<4
+requests>=2.32,<3
+packaging>=25,<27
+PyYAML>=6,<7
+rich==13.9.4
+safetensors==0.8.0
+importlib_resources>=7,<8
+pandas>=2.2,<4
+pytest>=9,<10
+
+# Development checks run in the existing environment.
+pre-commit==4.3.0
+ruff==0.13.1

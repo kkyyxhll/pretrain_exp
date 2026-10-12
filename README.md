@@ -1,0 +1,134 @@
+# pretrain_exp
+
+Qwen3.5-0.8B-Base 文本主干预训练。单机 DP2，使用 vendored OLMo-core、FlashAttention2 和 FLA；随机初始化，8个官方训练分片直接流式读取 `.jsonl.zst`。开发流程见 [DEVELOPING.md](DEVELOPING.md)。
+
+## 环境与输入
+
+使用已有环境，不重新安装另一套 OLMo：
+
+```bash
+conda activate olmo
+python -m pip check
+# requirements.txt 是兼容依赖清单；共享环境变更由维护者协调。
+```
+
+运行日志、checkpoint 和校准证据放在开发目录下的独立 runtime 目录；固定 tokenizer 资产放在 Qwen3.5 配方目录中并忽略 Git。在当前终端按实际目录设置：
+
+```bash
+export EXP_DIR=/path/to/dev
+cd "$EXP_DIR/pretrain_exp"
+export DATA_DIR=/path/to/dolma3
+export RUNTIME_DIR="$EXP_DIR/pretrain_exp-runtime"
+export TOKENIZER_DIR="$EXP_DIR/pretrain_exp/recipes/qwen35-08b/tokenizer-qwen35"
+mkdir -p "$RUNTIME_DIR"
+```
+
+`DATA_DIR` 应包含 `dolma3_mix_50B-00000.jsonl.zst` 至 `00007.jsonl.zst`。已有压缩源文件直接使用，不写解压语料或 token 缓存。A评估使用已有 `dolma3_mix_100M_a.jsonl`。
+
+共享机器磁盘空间有限。运行前检查 `$RUNTIME_DIR` 所在磁盘的剩余空间，给完整 checkpoint 保存预留余量。开发只记录必要的配置、简洁日志、结果、成本和恢复校验摘要，不重复复制语料、tokenizer 或大文件。checkpoint 只保留当前恢复所需的最新完整状态，以及仍需验证的最终或候选状态；每档训练和验证结束后及时归档所需权重，再由运行负责人清理已被替代的 checkpoint。清理前确认没有作业或后续恢复依赖它，不删除其他人的文件；失败原因与成本记录仍保留。
+
+只下载固定版本 tokenizer，不下载模型权重。镜像配置仅作用于当前终端；AutoDL需要加速时可先 `source /etc/network_turbo`（[说明](https://www.autodl.com/docs/network_turbo/)）：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_DISABLE_XET=1
+python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'Qwen/Qwen3.5-0.8B-Base',
+    revision='dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68',
+    allow_patterns=['tokenizer.json', 'tokenizer_config.json', 'vocab.json',
+                    'merges.txt', 'special_tokens_map.json'],
+    local_dir=os.environ['TOKENIZER_DIR'],
+)
+PY
+```
+
+## DP2训练
+
+默认每卡 microbatch16，累积4次，每卡每次更新64条，全局batch128、length8192、seed20261011。FP32主参数和optimizer/BF16计算；AdamW LR3e-4、betas0.9/0.95、weight decay0.1、clip1，cosine最低比例0.1。完整激活重计算和1024-token分块CE降低显存占用。单机容器通信默认 `NCCL_P2P_DISABLE=1`，改用已校准的共享内存路径；恢复保持相同设置，只有独立P2P通信检查通过后才覆盖它。
+
+四档各自随机初始化、独立cosine；先提交代码并保持干净版本：
+
+| 预算 | 更新步数 | 输入token位置 | 完整步参考FLOPs | warmup步数 |
+| ---: | ---: | ---: | ---: | ---: |
+| 3e17 | 55 | 57,671,680 | 301,694,823,746,764,800 | 10 |
+| 1e18 | 182 | 190,840,832 | 998,335,598,580,203,520 | 10 |
+| 3e18 | 547 | 573,571,072 | 3,000,492,156,172,369,920 | 11 |
+| 1e19 | 1823 | 1,911,554,048 | 9,999,812,067,097,313,280 | 36 |
+
+计算预算仅使用 [固定版 Megatron函数](https://github.com/NVIDIA/Megatron-LM/blob/b92c3ed70029005fd5769d2cf4c65bc3d061a74b/megatron/training/training.py)，原件位于 `third_party/megatron/reference.py`，适配器位于 `src/utils/megatron_budget.py`，函数SHA在入口校验。取最近完整更新，误差≤1%；训练每更新5,485,360,431,759,360参考FLOPs，不包含optimizer、通信或激活重计算。FLA chunk额外矩阵运算尚待正式口径确认。
+
+只打印计划，不启动GPU：
+
+```bash
+python recipes/qwen35-08b/train.py --budget 300000000000000000 \
+  --data-dir "$DATA_DIR" --tokenizer-dir "$TOKENIZER_DIR" \
+  --output "$RUNTIME_DIR/plan-unused" --plan
+```
+
+工程校准最多8个累计更新，使用新目录，成本独立记录：
+
+```bash
+export RUN_DIR="$RUNTIME_DIR/smoke-attempt01"
+bash recipes/qwen35-08b/train_qwen35_dp2.sh 300000000000000000 --smoke-steps 2
+```
+
+正式四档串行运行，每档新目录，任何失败立即停止后续档：
+
+```bash
+set -e
+for budget in 300000000000000000 1000000000000000000 3000000000000000000 10000000000000000000; do
+  export RUN_DIR="$RUNTIME_DIR/qwen35-${budget}-seed20261011-attempt01"
+  bash recipes/qwen35-08b/train_qwen35_dp2.sh "$budget" > "$RUNTIME_DIR/qwen35-${budget}-attempt01.log" 2>&1
+done
+```
+
+已有输出目录禁止覆盖。每档保存配置、环境、数据/tokenizer身份、逐步loss/成本、checkpoint及结果。完整恢复仍需新输出目录：在相同预算命令末尾添加 `--resume /path/to/own/checkpoint/stepN`。并行度、输入、microbatch、源码和调度必须保持一致，累计算量不会重置。固定seed保证可追溯，不能宣称bitwise相同。
+
+## 完整A验证
+
+A仅验证/选型，B不进入反馈。缓存只保存评估token和mask，不解压训练语料；首次创建新缓存目录，后续可复用。
+
+```bash
+python eval/native.py prepare --dataset-path "$DATA_DIR/dolma3_mix_100M_a.jsonl" \
+  --tokenizer "$TOKENIZER_DIR" --cache-dir "$RUNTIME_DIR/eval-a-cache"
+
+python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=2 \
+  eval/native.py evaluate --spec "$RUN_DIR/train.json" \
+  --checkpoint "$RUN_DIR/checkpoint/step55" --cache-dir "$RUNTIME_DIR/eval-a-cache" \
+  --output-dir "$RUNTIME_DIR/eval-a-attempt01" --sequence-length 8192 \
+  --batch-size 16 --loss-chunk-tokens 1024 --precision fp32-master-bf16
+```
+
+每档评估替换对应 `RUN_DIR`、checkpoint步数及新评估目录。BPB使用完整A原始UTF-8分母；native耗时含CE，不是正式EvalTime。部分评估不输出完整BPB。
+
+## 已有四档结果
+
+[JSONL](docs/bpb-results.jsonl) · [SVG](docs/qwen35-four-tier.svg)
+
+![四档BPB](docs/qwen35-four-tier.png)
+
+完整A BPB分别为 **2.490339、2.094881、1.801403、1.428890**。结果是固定架构、配方、单seed的四点观测；没有最优架构证明、多seed误差估计或外推拟合。A有历史选型使用，结果为开发验证，正式榜单认证尚未完成。
+
+## 检查
+
+自有代码使用 Ruff 和 pre-commit 统一格式与检查；官方评估原件、vendored OLMo 和 Megatron 参考原件不格式化，以保留其身份与哈希。共享 worktree 的个人 hook 安装见 [DEVELOPING.md](DEVELOPING.md)。
+
+```bash
+python -m pytest tests -q
+pre-commit run --all-files
+git diff --check
+python recipes/qwen35-08b/train.py --help
+```
+
+首次提交前由维护者先 `git add .`，再运行 `pre-commit run --all-files`；空索引不能检查尚未加入 Git 的文件。若格式工具修改了文件，检查改动、重新暂存并再次运行，全部通过后再提交。
+
+## 目录
+
+- `recipes/qwen35-08b/`：本模型训练入口、DP2启动脚本、模型配方、固定配置和本地 tokenizer 资产。
+- `src/arch/`、`src/data/`、`src/train/`：模型、压缩流式数据和训练组件；数据读取所需的 tokenizer 辅助也在 `src/data/`。
+- `src/utils/megatron_budget.py`、`third_party/megatron/`：官方参考计算预算的适配器与原件。
+- `docs/`：本模型已有四档结果图与 JSONL。
+- `$RUNTIME_DIR/`：每次运行的日志、checkpoint、校准和失败证据，不加入 Git。

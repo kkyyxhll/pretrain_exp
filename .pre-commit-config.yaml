@@ -1,0 +1,21 @@
+minimum_pre_commit_version: "4.3.0"
+default_stages: [pre-commit]
+exclude: ^(third_party/|eval/official/|recipes/qwen35-08b/tokenizer-qwen35/)
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: Ruff format
+        entry: python -m ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-check
+        name: Ruff lint and imports
+        entry: python -m ruff check --fix
+        language: system
+        types_or: [python, pyi]
+      - id: bash-syntax
+        name: Bash syntax
+        entry: bash -n
+        language: system
+        types: [shell]
