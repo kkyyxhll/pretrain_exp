@@ -1,1 +1,1 @@
-"""Architecture specifications and explicit component registry."""
+"""Architecture specifications and configuration translation."""

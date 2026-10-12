@@ -10,7 +10,7 @@ repos:
         language: system
         types_or: [python, pyi]
       - id: ruff-check
-        name: Ruff lint and imports
+        name: Ruff typing, lint and imports
         entry: python -m ruff check --fix
         language: system
         types_or: [python, pyi]

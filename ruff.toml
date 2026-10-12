@@ -3,8 +3,4 @@ line-length = 100
 extend-exclude = ["third_party", "eval/official", "recipes/qwen35-08b/tokenizer-qwen35"]
 
 [lint]
-select = ["E4", "E7", "E9", "F", "I"]
-
-[lint.per-file-ignores]
-"recipes/qwen35-08b/train.py" = ["E402"]
-"tests/conftest.py" = ["E402"]
+select = ["ANN", "E4", "E7", "E9", "F", "I", "UP"]

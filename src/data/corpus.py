@@ -1,107 +1,74 @@
-#!/usr/bin/env python3
-"""Streaming document reader for the official Dolma3 shards.
+"""Read compressed documents without changing text or UTF-8 byte accounting."""
 
-Reads `.jsonl` and `.jsonl.zst` through one code path with a flat memory
-profile. The eight shards are 22.92 GB compressed and 228.23 GB decompressed,
-so documents are streamed without materialising another full corpus.
-
-Three properties matter downstream and are deliberately not configurable:
-
-* `text` is handed out as a python `str`, unmodified. `Document.nbytes` is
-  `len(text.encode("utf-8"))` -- the same expression as
-  eval/official/eval.py:35, which is the bpb denominator. Nothing here
-  normalises, strips or re-encodes text, because any of those would move the
-  denominator away from the official one.
-* Document identity is `(shard file name, line index)` where the line index
-  counts every line in the file, blank ones included. That makes it a pure
-  file offset, so a resume point means the same thing at every world size.
-* Rank sharding is a stride over that line index, and a line this rank does
-  not own is never JSON-decoded. Each rank decodes only its assigned lines.
-  Decompression is still paid in full by every rank because the shards'
-  zstd frames do not declare their content size and are not seekable.
-
-Encoding policy: a JSON `\\uD800`-style escape decodes to a lone surrogate,
-which `text.encode("utf-8")` rejects -- it would kill the official evaluator at
-eval.py:35 before tokenization. Such a document is skipped and counted, never
-silently repaired: re-encoding with `errors="replace"` would change the byte
-count and therefore the bpb denominator. Use `on_bad_utf8="raise"` for a
-pre-flight scan. A missing or non-string `text` field is always an error, since
-that indicates the record format itself changed.
-"""
+from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
-import sys
-import time
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO, Literal, TypedDict
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+import zstandard
 
-# 4 MiB streaming reads. The longest document measured in the corpus
-# is about 270 KB, so a 4 MiB block holds many complete lines and the residual
-# buffer stays small.
-CHUNK = 1 << 22
+READ_CHUNK_BYTES = 1 << 22
+TEXT_FIELD = "text"
+RecordPolicy = Literal["skip", "raise"]
 
-TEXT_KEY = "text"
-BAD_UTF8_POLICIES = ("skip", "raise")
+
+class CorpusState(TypedDict):
+    """Identify the last yielded document and its rank ownership."""
+
+    epoch: int
+    shard: str
+    line: int
+    rank: int
+    world_size: int
 
 
 class CorpusError(RuntimeError):
-    """A corpus path, record format or encoding problem the caller must resolve."""
-
-
-def require_zstandard():
-    try:
-        import zstandard
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise CorpusError(
-            "the python zstandard module is required to read .jsonl.zst "
-            "(the zstd CLI is absent from this environment)"
-        ) from exc
-    return zstandard
+    """Report invalid corpus paths, records, or encoding."""
 
 
 @contextlib.contextmanager
-def open_stream(path):
-    """Yield a forward-only binary stream of decompressed bytes."""
-    path = Path(path)
-    name = path.name
-    if not path.exists():
-        raise CorpusError(f"{path} does not exist")
-    if name.endswith(".jsonl.zst"):
-        zstandard = require_zstandard()
-        with path.open("rb") as handle:
-            # read_across_frames: the official shards are written as multiple
-            # zstd frames. A reader that stops at the first frame truncates the
-            # corpus silently, which is far worse than failing.
-            yield zstandard.ZstdDecompressor().stream_reader(handle, read_across_frames=True)
-    elif name.endswith(".jsonl"):
-        with path.open("rb") as handle:
-            yield handle
+def open_stream(shard_path: str | Path) -> Iterator[BinaryIO | zstandard.ZstdDecompressionReader]:
+    """Open a forward-only decompressed byte stream."""
+    shard_path = Path(shard_path)
+    shard_name = shard_path.name
+    if not shard_path.exists():
+        raise CorpusError(f"{shard_path} does not exist")
+    elif shard_name.endswith(".jsonl.zst"):
+        with shard_path.open("rb") as compressed_stream:
+            # note (kkyyxhll): Official shards contain multiple frames; stopping early loses records.
+            yield zstandard.ZstdDecompressor().stream_reader(
+                compressed_stream, read_across_frames=True
+            )
+    elif shard_name.endswith(".jsonl"):
+        with shard_path.open("rb") as document_stream:
+            yield document_stream
     else:
-        raise CorpusError(f"{name}: expected a .jsonl or .jsonl.zst file")
+        raise CorpusError(f"{shard_name}: expected a .jsonl or .jsonl.zst file")
 
 
-def iter_raw_lines(path, *, chunk_size=CHUNK):
-    """Yield complete lines as bytes, with no decoding and no parsing.
+def iter_raw_lines(
+    shard_path: str | Path, *, chunk_size: int = READ_CHUNK_BYTES
+) -> Iterator[bytes]:
+    """Yield newline-stripped records, including an unterminated final record."""
+    with open_stream(shard_path) as document_stream:
+        pending_bytes = b""
+        while chunk_bytes := document_stream.read(chunk_size):
+            pending_bytes += chunk_bytes
+            *complete_lines, pending_bytes = pending_bytes.split(b"\n")
+            yield from complete_lines
+        if pending_bytes:
+            yield pending_bytes
+        else:
+            pass
 
-    The trailing newline is stripped. A final line without a newline is still
-    yielded, so a truncated file loses no record that is actually present.
-    """
-    with open_stream(path) as stream:
-        buffer = b""
-        while block := stream.read(chunk_size):
-            buffer += block
-            *complete, buffer = buffer.split(b"\n")
-            yield from complete
-        if buffer:
-            yield buffer
 
-
-@dataclasses.dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Document:
-    """One record. `index` counts every line in `shard`, blank lines included."""
+    """Store original text and its stable shard, line, and corpus-pass identity."""
 
     shard: str
     index: int
@@ -110,311 +77,190 @@ class Document:
 
     @property
     def nbytes(self) -> int:
-        """UTF-8 byte count: eval/official/eval.py:35's expression verbatim."""
+        """Count original UTF-8 bytes for the established document interface."""
         return len(self.text.encode("utf-8"))
 
 
-def _has_surrogate_escape(line: bytes) -> bool:
-    """Cheap pre-filter for lines that could decode to a lone surrogate.
-
-    A surrogate can only reach a python str through a JSON `\\uXXXX` escape --
-    json.loads rejects malformed raw UTF-8 outright -- and JSON spells that
-    escape with a lowercase `u`. So two substring scans cover every case and
-    the expensive validation runs on almost no lines.
-    """
-    return b"\\ud" in line or b"\\uD" in line
-
-
 class CorpusReader:
-    """Streams documents from an ordered list of shards, one rank's share.
-
-    Resume is exact but not cheap: zstd frames here are not seekable, so
-    restarting inside a shard re-reads and discards that shard's earlier bytes.
-    Discarding skips JSON decoding, so it runs at decompression speed.
-    """
+    """Yield one rank's documents and resume by replaying compressed bytes."""
 
     def __init__(
         self,
-        paths,
+        paths: Sequence[str | Path],
         *,
-        rank=0,
-        world_size=1,
-        text_key=TEXT_KEY,
-        on_bad_utf8="skip",
-        on_blank="skip",
-        loop=False,
-        chunk_size=CHUNK,
-    ):
+        rank: int = 0,
+        world_size: int = 1,
+        text_key: str = TEXT_FIELD,
+        on_bad_utf8: RecordPolicy = "skip",
+        on_blank: RecordPolicy = "skip",
+        loop: bool = False,
+        chunk_size: int = READ_CHUNK_BYTES,
+    ) -> None:
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise CorpusError("rank must be an int")
-        if not isinstance(world_size, int) or isinstance(world_size, bool):
+        elif not isinstance(world_size, int) or isinstance(world_size, bool):
             raise CorpusError("world_size must be an int")
-        if world_size < 1:
+        elif world_size < 1:
             raise CorpusError(f"world_size must be >= 1, got {world_size}")
-        if not 0 <= rank < world_size:
+        elif not 0 <= rank < world_size:
             raise CorpusError(f"rank {rank} is outside [0, {world_size})")
-        if on_bad_utf8 not in BAD_UTF8_POLICIES:
-            raise CorpusError(
-                f"on_bad_utf8 must be one of {BAD_UTF8_POLICIES}, got {on_bad_utf8!r}"
-            )
-        if on_blank not in ("skip", "raise"):
+        elif on_bad_utf8 not in ("skip", "raise"):
+            raise CorpusError(f"on_bad_utf8 must be 'skip' or 'raise', got {on_bad_utf8!r}")
+        elif on_blank not in ("skip", "raise"):
             raise CorpusError("on_blank must be 'skip' or 'raise'")
-        self.paths = [Path(p) for p in paths]
+        else:
+            pass
+        self.paths: list[Path] = [Path(shard_path) for shard_path in paths]
+        shard_names = [shard_path.name for shard_path in self.paths]
         if not self.paths:
             raise CorpusError("no shard paths given")
-        names = [p.name for p in self.paths]
-        if len(set(names)) != len(names):
-            # Resume state records a shard by name, so names must be unique.
-            raise CorpusError(f"shard file names must be unique, got {names}")
-        self.rank = rank
-        self.world_size = world_size
-        self.text_key = text_key
-        self.on_bad_utf8 = on_bad_utf8
-        self.on_blank = on_blank
-        self.loop = loop
-        self.chunk_size = chunk_size
-        self.documents_yielded = 0
-        self.lines_blank = 0
-        self.bad_utf8 = 0
-        self._position = None
+        elif len(set(shard_names)) != len(shard_names):
+            raise CorpusError(f"shard file names must be unique, got {shard_names}")
+        else:
+            pass
+        self.rank: int = rank
+        self.world_size: int = world_size
+        self.text_key: str = text_key
+        self.on_bad_utf8: RecordPolicy = on_bad_utf8
+        self.on_blank: RecordPolicy = on_blank
+        self.loop: bool = loop
+        self.chunk_size: int = chunk_size
+        self.documents_yielded: int = 0
+        self.lines_blank: int = 0
+        self.bad_utf8: int = 0
+        self.position: tuple[int, str, int] | None = None
 
-    def state(self) -> dict | None:
-        """Resume point covering every document yielded so far, or None."""
-        if self._position is None:
+    def state(self) -> CorpusState | None:
+        """Return the cursor covering every document yielded so far."""
+        if self.position is None:
             return None
-        epoch, shard, index = self._position
-        return {
-            "epoch": epoch,
-            "shard": shard,
-            "line": index,
-            "rank": self.rank,
-            "world_size": self.world_size,
-        }
+        else:
+            corpus_epoch, shard_name, line_index = self.position
+            return {
+                "epoch": corpus_epoch,
+                "shard": shard_name,
+                "line": line_index,
+                "rank": self.rank,
+                "world_size": self.world_size,
+            }
 
-    def _plan(self, resume):
-        """Translate a resume dict into (shard offset, line to skip past, epoch)."""
+    def resume_plan(self, resume: CorpusState | None) -> tuple[int, int, int]:
+        """Resolve a checkpoint to shard offset, skipped line, and corpus pass."""
         if resume is None:
             return 0, -1, 0
-        for key in ("epoch", "shard", "line", "rank", "world_size"):
-            if key not in resume:
-                raise CorpusError(f"resume state is missing {key!r}")
-        if (resume["rank"], resume["world_size"]) != (self.rank, self.world_size):
-            # Replaying another rank's stride would both duplicate and drop
-            # documents, so this has to be refused rather than reinterpreted.
-            raise CorpusError(
-                f"resume state is for rank {resume['rank']}/{resume['world_size']} "
-                f"but this reader is rank {self.rank}/{self.world_size}; "
-                "a checkpoint can only resume at the world size that wrote it"
-            )
-        names = [p.name for p in self.paths]
-        if resume["shard"] not in names:
-            raise CorpusError(
-                f"resume state names shard {resume['shard']!r}, which is not in "
-                f"this reader's shard list {names}"
-            )
-        return names.index(resume["shard"]), int(resume["line"]), int(resume["epoch"])
+        else:
+            for state_field in ("epoch", "shard", "line", "rank", "world_size"):
+                if state_field not in resume:
+                    raise CorpusError(f"resume state is missing {state_field!r}")
+                else:
+                    pass
+            shard_names = [shard_path.name for shard_path in self.paths]
+            if (resume["rank"], resume["world_size"]) != (self.rank, self.world_size):
+                raise CorpusError(
+                    f"resume state is for rank {resume['rank']}/{resume['world_size']} "
+                    f"but this reader is rank {self.rank}/{self.world_size}; "
+                    "a checkpoint can only resume at the world size that wrote it"
+                )
+            elif resume["shard"] not in shard_names:
+                raise CorpusError(
+                    f"resume state names shard {resume['shard']!r}, which is not in "
+                    f"this reader's shard list {shard_names}"
+                )
+            else:
+                return (
+                    shard_names.index(resume["shard"]),
+                    int(resume["line"]),
+                    int(resume["epoch"]),
+                )
 
-    def documents(self, resume=None):
-        """Yield this rank's documents in shard order."""
-        shard_offset, skip_through, epoch = self._plan(resume)
+    def documents(self, resume: CorpusState | None = None) -> Iterator[Document]:
+        """Yield the rank's original documents in shard order."""
+        shard_offset, skipped_line_index, corpus_epoch = self.resume_plan(resume)
         if resume is not None:
-            self._position = (epoch, resume["shard"], skip_through)
+            self.position = (corpus_epoch, resume["shard"], skipped_line_index)
+        else:
+            pass
         while True:
-            pass_start = self.documents_yielded
-            full_pass = shard_offset == 0 and skip_through == -1
+            starting_document_count = self.documents_yielded
+            is_complete_pass = shard_offset == 0 and skipped_line_index == -1
             for shard_index in range(shard_offset, len(self.paths)):
-                path = self.paths[shard_index]
-                name = path.name
-                for line_index, line in enumerate(iter_raw_lines(path, chunk_size=self.chunk_size)):
-                    if line_index <= skip_through:
+                shard_path = self.paths[shard_index]
+                shard_name = shard_path.name
+                for line_index, line_bytes in enumerate(
+                    iter_raw_lines(shard_path, chunk_size=self.chunk_size)
+                ):
+                    if line_index <= skipped_line_index:
                         continue
-                    if line_index % self.world_size != self.rank:
+                    elif line_index % self.world_size != self.rank:
                         continue
-                    if not line or line.isspace():
+                    elif not line_bytes or line_bytes.isspace():
                         if self.on_blank == "raise":
-                            raise CorpusError(f"{name} line {line_index}: blank JSONL record")
-                        self.lines_blank += 1
-                        continue
-                    text = self._text_of(line, name, line_index)
-                    if text is None:
-                        continue
-                    self._position = (epoch, name, line_index)
-                    self.documents_yielded += 1
-                    yield Document(shard=name, index=line_index, epoch=epoch, text=text)
-                # Only the shard named by the resume state is entered partway.
-                skip_through = -1
+                            raise CorpusError(f"{shard_name} line {line_index}: blank JSONL record")
+                        else:
+                            self.lines_blank += 1
+                            continue
+                    else:
+                        document_text = self.decode_text(line_bytes, shard_name, line_index)
+                        if document_text is None:
+                            continue
+                        else:
+                            self.position = (corpus_epoch, shard_name, line_index)
+                            self.documents_yielded += 1
+                            yield Document(
+                                shard=shard_name,
+                                index=line_index,
+                                epoch=corpus_epoch,
+                                text=document_text,
+                            )
+                skipped_line_index = -1
             shard_offset = 0
             if not self.loop:
                 return
-            if full_pass and self.documents_yielded == pass_start:
+            elif is_complete_pass and self.documents_yielded == starting_document_count:
                 raise CorpusError("cannot loop over a corpus containing no documents")
-            epoch += 1
+            else:
+                corpus_epoch += 1
 
-    def _text_of(self, line: bytes, shard: str, index: int):
-        """Decode one line to text, or None when policy says to skip it."""
+    def decode_text(self, line_bytes: bytes, shard_name: str, line_index: int) -> str | None:
+        """Decode a record, rejecting invalid text unless the skip policy is explicit."""
         try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise CorpusError(f"{shard} line {index}: not valid JSON: {exc}") from exc
-        if not isinstance(record, dict):
+            decoded_record: object = json.loads(line_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as encoding_error:
             raise CorpusError(
-                f"{shard} line {index}: record is {type(record).__name__}, not an object"
+                f"{shard_name} line {line_index}: not valid JSON: {encoding_error}"
+            ) from encoding_error
+        if not isinstance(decoded_record, dict):
+            raise CorpusError(
+                f"{shard_name} line {line_index}: record is "
+                f"{type(decoded_record).__name__}, not an object"
             )
-        try:
-            text = record[self.text_key]
-        except KeyError:
+        elif self.text_key not in decoded_record:
             raise CorpusError(
-                f"{shard} line {index}: record has no {self.text_key!r} field "
-                f"(keys: {sorted(record)[:8]})"
-            ) from None
-        if not isinstance(text, str):
-            raise CorpusError(
-                f"{shard} line {index}: {self.text_key!r} is {type(text).__name__}, not a string"
+                f"{shard_name} line {line_index}: record has no {self.text_key!r} field "
+                f"(keys: {sorted(decoded_record)[:8]})"
             )
-        if _has_surrogate_escape(line):
-            try:
-                text.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                if self.on_bad_utf8 == "raise":
-                    raise CorpusError(
-                        f"{shard} line {index}: {self.text_key!r} contains a lone "
-                        f"surrogate that UTF-8 cannot encode ({exc.reason}); this "
-                        "document would also abort eval/official/eval.py:35"
-                    ) from exc
-                self.bad_utf8 += 1
-                return None
-        return text
-
-
-def resolve_shards(shards=None, splits=("train",)):
-    """Find official shards directly on disk; prefer existing plain JSONL."""
-    result = []
-    for split in splits or ("train",):
-        if split == "train":
-            candidates = sorted((REPO_ROOT / "data" / "train").glob("dolma3_mix_50B-*.jsonl*"))
-        elif split == "eval_a":
-            candidates = sorted((REPO_ROOT / "eval").glob("dolma3_mix_100M_a.jsonl*"))
         else:
-            raise CorpusError(f"unknown split: {split}")
-        by_name = {}
-        for path in candidates:
-            if not (path.name.endswith(".jsonl") or path.name.endswith(".jsonl.zst")):
-                continue
-            name = path.name.removesuffix(".zst")
-            if name not in by_name or path.suffix == ".jsonl":
-                by_name[name] = path
-        result.extend(by_name.values())
-    if shards:
-        selected = []
-        for shard in shards:
-            matches = [p for p in result if shard in p.name]
-            if not matches:
-                raise CorpusError(f"shard not found: {shard}")
-            selected.extend(matches)
-        result = selected
-    if not result:
-        raise CorpusError("no data files found; download the shards as described in README.md")
-    return sorted(set(result))
-
-
-def corpus_texts(reader, *, max_bytes, report_every=None, stream=sys.stderr):
-    """Yield texts until `max_bytes` of UTF-8 source has been handed over."""
-    served = 0
-    documents = 0
-    started = time.monotonic()
-    for document in reader.documents():
-        text = document.text
-        served += document.nbytes
-        documents += 1
-        yield text
-        if report_every and documents % report_every == 0:
-            elapsed = max(time.monotonic() - started, 1e-9)
-            print(
-                f"  fed {documents} docs / {served / 1e6:.0f} MB "
-                f"({served / 1e6 / elapsed:.0f} MB/s)",
-                file=stream,
-                flush=True,
-            )
-        if served >= max_bytes:
-            break
-    reader.fed_bytes = served
-    reader.fed_documents = documents
-
-
-def guard_eval_split(paths, allow_eval_set):
-    """Refuse to fit a tokenizer on the A set unless told to, loudly.
-
-    Repo policy (AGENTS.md): the A set is for validation and model selection.
-    The rule text grants that use; it does not spell out a prohibition on
-    tokenizer fitting, so this is the repo's reading of the grant and not a
-    quoted official rule. The guard exists because the consequence -- a
-    submitted tokenizer fitted on evaluation data -- is not recoverable after
-    the deadline.
-    """
-    suspects = [
-        p.name for p in paths if "_a." in p.name or "_b." in p.name or "eval" in p.parts[-2:]
-    ]
-    if suspects and not allow_eval_set:
-        raise CorpusError(
-            f"refusing to train on {suspects}: these look like evaluation data, "
-            "and repo policy restricts the A set to validation and model "
-            "selection. Pass --allow-eval-set to override, and record it in the "
-            "model card if you do."
-        )
-    return suspects
-
-
-def sample_documents(count, *, shards=None, splits=("train",), paths=None):
-    """Read a sample of real documents for verification."""
-    resolved = [Path(p) for p in paths] if paths else resolve_shards(shards, splits)
-    reader = CorpusReader(resolved, on_bad_utf8="skip")
-    texts = []
-    for document in reader.documents():
-        texts.append(document.text)
-        if len(texts) >= count:
-            break
-    if not texts:
-        raise CorpusError(f"could not read any document from {resolved}")
-    return texts
-
-
-def scan_special_collisions(paths, names, *, max_bytes=0):
-    """Byte-scan corpus files for literal occurrences of special-token strings.
-
-    A document that literally contains "<|bos|>" tokenizes as one special id
-    under HuggingFace but as ordinary text under tiktoken, so train-time and
-    eval-time tokenization diverge there. Callers pass the special names (e.g.
-    `tokenizer.DEFAULT_SPECIALS`); the B set is never available to scan.
-    """
-    needles = {name: name.encode("utf-8") for name in names}
-    counts = {name: 0 for name in names}
-    # Carry over the longest needle minus one byte so an occurrence straddling
-    # a block boundary is seen.
-    keep = max((len(n) for n in needles.values()), default=1) - 1
-    scanned = 0
-    truncated = False
-    for path in paths:
-        with open_stream(path) as stream:
-            tail = b""
-            while block := stream.read(1 << 22):
-                scanned += len(block)
-                window = tail + block
-                for name, needle in needles.items():
-                    position = window.find(needle, max(0, keep - len(needle) + 1))
-                    while position != -1:
-                        counts[name] += 1
-                        position = window.find(needle, position + 1)
-                tail = window[-keep:] if keep else b""
-                if max_bytes and scanned >= max_bytes:
-                    truncated = True
-                    break
-        if truncated:
-            break
-    return {
-        "scanned_decompressed_bytes": scanned,
-        "complete_scan": not (max_bytes and scanned >= max_bytes),
-        "shards": [p.name for p in paths],
-        "occurrences": counts,
-        "clean": sorted(n for n, c in counts.items() if c == 0),
-        "colliding": {n: c for n, c in counts.items() if c},
-    }
+            document_text: object = decoded_record[self.text_key]
+            if not isinstance(document_text, str):
+                raise CorpusError(
+                    f"{shard_name} line {line_index}: {self.text_key!r} is "
+                    f"{type(document_text).__name__}, not a string"
+                )
+            else:
+                # note (kkyyxhll): Only JSON escapes can introduce lone surrogates after decoding.
+                if b"\\ud" in line_bytes or b"\\uD" in line_bytes:
+                    try:
+                        document_text.encode("utf-8")
+                    except UnicodeEncodeError as encoding_error:
+                        if self.on_bad_utf8 == "raise":
+                            raise CorpusError(
+                                f"{shard_name} line {line_index}: {self.text_key!r} contains a lone "
+                                f"surrogate that UTF-8 cannot encode ({encoding_error.reason}); "
+                                "this document would also abort the official evaluator"
+                            ) from encoding_error
+                        else:
+                            self.bad_utf8 += 1
+                            return None
+                else:
+                    pass
+                return document_text

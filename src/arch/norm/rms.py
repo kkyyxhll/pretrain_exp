@@ -3,99 +3,140 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar, Optional
+from typing import ClassVar, Literal, TypedDict
 
 import torch
 from olmo_core.config import DType
 from olmo_core.nn.config import ModuleConfig
-from olmo_core.nn.layer_norm import LayerNormConfig, LayerNormType, RMSNorm
+from olmo_core.nn.layer_norm import LayerNorm, LayerNormConfig, LayerNormType, RMSNorm
 
-from ..core.registry import register
 
-__all__ = ["RmsNormConfig"]
+class NormBuildArguments(TypedDict, total=False):
+    eps: float
+    elementwise_affine: bool
+    bias: bool
+    full_precision: bool
+    dtype: torch.dtype
+    weight_shape: tuple[int, ...]
 
 
 class Qwen23RMSNorm(RMSNorm):
-    """HF gain arithmetic, followed by OLMo's input-dtype output contract.
+    """Normalize before applying the gain in the input dtype."""
 
-    In particular, BF16 Q/K with FP32 master gains must not round the gain
-    before multiplication. The final cast matches the FlashAttention entry.
-    """
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autocast(enabled=False, device_type=x.device.type):
-            h = x.float()
-            h = (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)).to(x.dtype)
+            hidden_states = x.float()
+            hidden_states = (
+                hidden_states * torch.rsqrt(hidden_states.pow(2).mean(-1, keepdim=True) + self.eps)
+            ).to(x.dtype)
             if self.weight is not None:
-                h = h * self.weight
+                hidden_states = hidden_states * self.weight
+            else:
+                pass
             if self.bias is not None:
-                h = h + self.bias
-            return h.to(x.dtype)
+                hidden_states = hidden_states + self.bias
+            else:
+                pass
+            return hidden_states.to(x.dtype)
 
 
 class Qwen35RMSNorm(RMSNorm):
-    """HF Qwen3.5: zero gain, FP32 normalize/affine, then cast back."""
+    """Normalize and apply the zero-offset gain in FP32."""
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
         if self.weight is not None:
             torch.nn.init.zeros_(self.weight)
+        else:
+            pass
         if self.bias is not None:
             torch.nn.init.zeros_(self.bias)
+        else:
+            pass
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autocast(enabled=False, device_type=x.device.type):
-            h = x.float()
-            h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+            hidden_states = x.float()
+            hidden_states = hidden_states * torch.rsqrt(
+                hidden_states.pow(2).mean(-1, keepdim=True) + self.eps
+            )
             if self.weight is not None:
-                h = h * (1.0 + self.weight.float())
+                hidden_states = hidden_states * (1.0 + self.weight.float())
+            else:
+                pass
             if self.bias is not None:
-                h = h + self.bias.float()
-            return h.to(x.dtype)
+                hidden_states = hidden_states + self.bias.float()
+            else:
+                pass
+            return hidden_states.to(x.dtype)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Qwen35RMSNormConfig(LayerNormConfig):
-    """Use OLMo's norm contract, including meta materialization/reset."""
+    """Preserve the norm initialization and meta-materialization contract."""
 
-    norm_cls: ClassVar[type] = Qwen35RMSNorm
+    norm_cls: ClassVar[type[RMSNorm]] = Qwen35RMSNorm
 
-    def build(self, size, init_device="cpu", weight_shape=None):
-        kwargs = self.as_dict(exclude_none=True)
-        kwargs.pop("name")
-        if (dtype := kwargs.pop("dtype", None)) is not None:
-            kwargs["dtype"] = dtype.as_pt()
+    def build(
+        self,
+        size: int,
+        init_device: str = "cpu",
+        weight_shape: tuple[int, ...] | None = None,
+    ) -> RMSNorm:
+        norm_arguments: NormBuildArguments = {}
+        if self.eps is not None:
+            norm_arguments["eps"] = self.eps
+        else:
+            pass
+        if self.elementwise_affine is not None:
+            norm_arguments["elementwise_affine"] = self.elementwise_affine
+        else:
+            pass
+        if self.bias is not None:
+            norm_arguments["bias"] = self.bias
+        else:
+            pass
+        if self.full_precision is not None:
+            norm_arguments["full_precision"] = self.full_precision
+        else:
+            pass
+        if self.dtype is not None:
+            norm_arguments["dtype"] = self.dtype.as_pt()
+        else:
+            pass
         if weight_shape is not None:
-            kwargs["weight_shape"] = weight_shape
-        return self.norm_cls(size=size, init_device=init_device, **kwargs)
+            norm_arguments["weight_shape"] = weight_shape
+        else:
+            pass
+        return self.norm_cls(size=size, init_device=init_device, **norm_arguments)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Qwen23RMSNormConfig(Qwen35RMSNormConfig):
-    norm_cls: ClassVar[type] = Qwen23RMSNorm
+    """Select the Qwen2/3 gain arithmetic."""
+
+    norm_cls: ClassVar[type[RMSNorm]] = Qwen23RMSNorm
 
 
-@register("norm", "rms")
-@dataclass
+@dataclass(kw_only=True)
 class RmsNormConfig(ModuleConfig):
-    """qwen selects Qwen2/3 rounding; unit_offset selects Qwen3.5."""
+    """Select Qwen gain arithmetic without changing serialized config keys."""
 
-    qwen: bool = False  # True → Qwen2/3 x*w, weight initialized to one
-    unit_offset: bool = False  # Qwen3.5 (1+w), weight initialized to zero
-    eps: Optional[float] = None
-    bias: Optional[bool] = None
-    dtype: str = "float32"
+    qwen: bool = False
+    unit_offset: bool = False
+    eps: float | None = None
+    bias: bool | None = None
+    dtype: Literal["float32", "bfloat16", "float16"] = "float32"
 
     def to_olmo(self) -> LayerNormConfig:
         if self.qwen and self.unit_offset:
             raise ValueError("qwen and unit_offset select distinct norm semantics")
-        config_cls = (
-            Qwen35RMSNormConfig
-            if self.unit_offset
-            else Qwen23RMSNormConfig
-            if self.qwen
-            else LayerNormConfig
-        )
-        return config_cls(
+        elif self.unit_offset:
+            norm_config_class = Qwen35RMSNormConfig
+        elif self.qwen:
+            norm_config_class = Qwen23RMSNormConfig
+        else:
+            norm_config_class = LayerNormConfig
+        return norm_config_class(
             name=LayerNormType.qwen_rms if self.qwen else LayerNormType.rms,
             eps=self.eps,
             bias=False if self.bias is None else self.bias,
@@ -105,5 +146,5 @@ class RmsNormConfig(ModuleConfig):
     def num_params(self, d_model: int) -> int:
         return self.to_olmo().num_params(d_model)
 
-    def build(self, d_model: int, *, init_device: str = "cpu"):
+    def build(self, d_model: int, *, init_device: str = "cpu") -> LayerNorm:
         return self.to_olmo().build(d_model, init_device=init_device)

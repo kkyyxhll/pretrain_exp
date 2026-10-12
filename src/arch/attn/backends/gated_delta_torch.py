@@ -1,42 +1,55 @@
-"""Torch reference adapted from transformers Qwen3.5 (Apache-2.0)."""
+"""Torch GatedDeltaNet reference adapted from Transformers (Apache-2.0)."""
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as functional
+
+L2_NORMALIZATION_EPSILON = 1e-6
+DEFAULT_CHUNK_TOKENS = 64
 
 
-def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """对齐 FLA 的 l2norm 实现（transformers 同款）。"""
-    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+def l2_normalize(hidden_states: torch.Tensor, dimension: int, epsilon: float) -> torch.Tensor:
+    return hidden_states * torch.rsqrt(
+        (hidden_states * hidden_states).sum(dim=dimension, keepdim=True) + epsilon
+    )
 
 
 def chunk_gated_delta_rule(
-    query, key, value, g, beta, chunk_size=64, use_qk_l2norm_in_kernel=False
-):
-    """transformers torch_chunk_gated_delta_rule 的逐行移植（Apache-2.0）。"""
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = DEFAULT_CHUNK_TOKENS,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> torch.Tensor:
+    """Apply the chunkwise gated delta recurrence."""
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
-        query = _l2norm(query, dim=-1, eps=1e-6)
-        key = _l2norm(key, dim=-1, eps=1e-6)
+        query = l2_normalize(query, dimension=-1, epsilon=L2_NORMALIZATION_EPSILON)
+        key = l2_normalize(key, dimension=-1, epsilon=L2_NORMALIZATION_EPSILON)
+    else:
+        pass
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        tensor.transpose(1, 2).contiguous().to(torch.float32)
+        for tensor in (query, key, value, beta, g)
     ]
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    total_sequence_length = sequence_length + pad_size
+    batch_size, head_count, sequence_tokens, key_head_channels = key.shape
+    value_head_channels = value.shape[-1]
+    padding_tokens = (chunk_size - sequence_tokens % chunk_size) % chunk_size
+    query = functional.pad(query, (0, 0, 0, padding_tokens))
+    key = functional.pad(key, (0, 0, 0, padding_tokens))
+    value = functional.pad(value, (0, 0, 0, padding_tokens))
+    beta = functional.pad(beta, (0, padding_tokens))
+    g = functional.pad(g, (0, padding_tokens))
+    padded_sequence_tokens = sequence_tokens + padding_tokens
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, k_beta, v_beta)
+    gated_values = value * beta.unsqueeze(-1)
+    gated_keys = key * beta.unsqueeze(-1)
+    query, key, value, gated_keys, gated_values = [
+        tensor.reshape(tensor.shape[0], tensor.shape[1], -1, chunk_size, tensor.shape[-1])
+        for tensor in (query, key, value, gated_keys, gated_values)
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
     mask = torch.triu(
@@ -45,46 +58,61 @@ def chunk_gated_delta_rule(
 
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    attention_weights = -((gated_keys @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
     for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = torch.zeros(
-        batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device
+        row_weights = attention_weights[..., i, :i].clone()
+        previous_weights = attention_weights[..., :i, :i].clone()
+        attention_weights[..., i, :i] = row_weights + (
+            row_weights.unsqueeze(-1) * previous_weights
+        ).sum(-2)
+    attention_weights = attention_weights + torch.eye(
+        chunk_size, dtype=attention_weights.dtype, device=attention_weights.device
     )
-    core_attn_out = torch.zeros_like(value)
+    value = attention_weights @ gated_values
+    decayed_keys = attention_weights @ (gated_keys * g.exp().unsqueeze(-1))
+    last_recurrent_state = torch.zeros(
+        batch_size,
+        head_count,
+        key_head_channels,
+        value_head_channels,
+        dtype=value.dtype,
+        device=value.device,
+    )
+    attention_output = torch.zeros_like(value)
     mask = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
     )
 
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+    for i in range(0, padded_sequence_tokens // chunk_size):
+        chunk_query, chunk_key, chunk_value = query[:, :, i], key[:, :, i], value[:, :, i]
+        attention_weights = (
+            chunk_query @ chunk_key.transpose(-1, -2) * decay_mask[:, :, i]
+        ).masked_fill(mask, 0)
+        predicted_values = (decayed_keys[:, :, i]) @ last_recurrent_state
+        updated_values = chunk_value - predicted_values
+        recurrent_attention = (chunk_query * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        attention_output[:, :, i] = recurrent_attention + attention_weights @ updated_values
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            + (chunk_key * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)
+            @ updated_values
         )
 
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    attention_output = attention_output.reshape(
+        attention_output.shape[0], attention_output.shape[1], -1, attention_output.shape[-1]
     )
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out
+    attention_output = attention_output[:, :, :sequence_tokens]
+    attention_output = attention_output.transpose(1, 2).contiguous().to(initial_dtype)
+    return attention_output
 
 
-def causal_conv1d(x, weight):
-    """Common backend layout: x [B,T,C], weight [C,K]."""
-    channels = x.shape[-1]
-    y = F.conv1d(
-        x.transpose(1, 2), weight.unsqueeze(1), groups=channels, padding=weight.shape[-1] - 1
+def causal_conv1d(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Convolve batch-token-channel inputs with per-channel kernels."""
+    channel_count = hidden_states.shape[-1]
+    convolved_states = functional.conv1d(
+        hidden_states.transpose(1, 2),
+        weight.unsqueeze(1),
+        groups=channel_count,
+        padding=weight.shape[-1] - 1,
     )
-    return F.silu(y[:, :, : x.shape[1]]).transpose(1, 2)
+    return functional.silu(convolved_states[:, :, : hidden_states.shape[1]]).transpose(1, 2)
