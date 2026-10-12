@@ -26,10 +26,15 @@ LEDGER_CALLBACK_PRIORITY = 100
 class AttemptResult(TypedDict):
     """Keep attempt costs distinct from the cumulative restored training path."""
 
-    status: Literal["preparing", "running", "completed", "smoke_completed", "failed"]
+    status: Literal["preparing", "running", "evaluating", "completed", "smoke_completed", "failed"]
     formal_training: bool
     completed_new_updates: int
     new_update_flops: int
+    checkpoint_saved: NotRequired[bool]
+    training_completed_wall_seconds: NotRequired[float]
+    evaluation_bpb: NotRequired[float | None]
+    evaluation_output: NotRequired[str]
+    evaluation_elapsed_seconds: NotRequired[float]
     attempted_step: NotRequired[int]
     cumulative_step: NotRequired[int]
     megatron_cumulative_flops: NotRequired[int]
@@ -109,6 +114,7 @@ class TrainingMeter(Callback):
         train_module: TransformerTrainModule,
         started_seconds: float,
         world_size: int,
+        record_state_digests: bool = True,
     ) -> None:
         super().__init__()
         self.output_directory = output_directory
@@ -118,6 +124,7 @@ class TrainingMeter(Callback):
         self.train_module = train_module
         self.started_seconds = started_seconds
         self.world_size = world_size
+        self.record_state_digests = record_state_digests
         self.cumulative_flops = 0
         self.scored_tokens = 0
         self.batch_input_sha256: str | None = None
@@ -219,4 +226,5 @@ class TrainingMeter(Callback):
 
     def post_train(self) -> None:
         """Save the final full-state identity after training ends."""
-        write_json(self.output_directory / "final-state-digests.json", self.state_digests())
+        if self.record_state_digests:
+            write_json(self.output_directory / "final-state-digests.json", self.state_digests())
