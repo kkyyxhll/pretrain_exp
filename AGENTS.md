@@ -11,8 +11,9 @@
 - Qwen3.5 配方集中在 `recipes/qwen35-08b/`：`train.py`、`train_qwen35_dp2.sh`、`model.py`、`config.json`。固定下载的 tokenizer 放在其 `tokenizer-qwen35/`，忽略 Git；流式读取所需辅助归 `src/data/`。
 - 四档训练预算3e17、1e18、3e18、1e19，仅调用 `src/utils/megatron_budget.py` 的固定版 Megatron 参考函数；官方原件和许可证在 `third_party/megatron/`。整数完整步误差≤1%；optimizer、通信、激活重计算不计入参考训练账本。FLA chunk额外矩阵计算的正式认证仍待确认。不要格式化或修改 vendored OLMo、Megatron参考原件及官方评估原件。
 - 正式运行需要干净 commit；工程 smoke 最多8个累计步，独立目录、源码文件哈希和成本留证。运行中不改所用源码，不覆盖输出，不清理别人的 GPU 进程。
-- 恢复须保持模型、并行度、microbatch、数据、tokenizer与调度身份，加载全部模型/optimizer/trainer/RNG/数据状态；累计 FLOPs 不重置。固定 seed 不代表 bitwise 保证。
+- 当前四档使用 `--no-checkpoints --eval-cache`：不保存权重或训练状态，训练结束直接验证内存中的最终模型，复用既有两个rank的进程组。正式运行必须有匹配的完整A缓存；无checkpoint模式不能恢复，中断后该档从随机初始化重跑，历史失败成本保留。固定 seed 不代表 bitwise 保证。
+- 可选checkpoint模式的恢复须保持模型、并行度、microbatch、数据、tokenizer与调度身份，加载全部模型/optimizer/trainer/RNG/数据状态；累计 FLOPs 不重置。
 - A仅验证/选型，B不进入反馈。完整A用原始 UTF-8 分母；EOS、padding和未预测首token不能进入分母。部分A不报告完整BPB，native耗时不是正式EvalTime。
-- 共享磁盘空间有限，启动前检查剩余容量并预留完整 checkpoint 空间。开发只记录必要的配置、简洁日志、结果、成本和恢复校验摘要，不重复复制数据或大文件。checkpoint 只保留当前恢复所需的最新完整状态和仍需验证的最终或候选状态；归档所需权重后，由运行负责人确认无作业或后续恢复依赖，再清理已被替代的 checkpoint，不删除其他人的文件。
+- 共享磁盘空间有限，启动前检查剩余容量。当前无checkpoint四档只记录必要的配置、简洁日志、训练/评估结果、权重摘要和全部成本；完整A缓存复用，不重复复制数据或大文件。若另用checkpoint模式，先预留完整状态空间，仅保留仍需恢复或验证的状态，由运行负责人确认无依赖后清理已被替代的文件，不删除其他人的文件。
 - 保留失败、取消、重试的原因和全部成本记录。运行证据统一放在 `$EXP_DIR/pretrain_exp-runtime`，通过 `$RUNTIME_DIR` 传入，不加入 Git。docs仅放可公开的本模型四档图表和 JSONL，不带机器路径、账号、密钥或部署元数据。
 - tests/为唯一项目测试目录，`python -m pytest tests -q`，使用临时小数据，不下载真实语料。仓库外文件路径通过环境变量传入。

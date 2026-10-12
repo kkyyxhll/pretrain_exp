@@ -12,7 +12,7 @@ python -m pip check
 # requirements.txt 是兼容依赖清单；共享环境变更由维护者协调。
 ```
 
-运行日志、checkpoint 和校准证据放在开发目录下的独立 runtime 目录；固定 tokenizer 资产放在 Qwen3.5 配方目录中并忽略 Git。在当前终端按实际目录设置：
+运行日志、评估结果和校准证据放在开发目录下的独立 runtime 目录；固定 tokenizer 资产放在 Qwen3.5 配方目录中并忽略 Git。在当前终端按实际目录设置：
 
 ```bash
 export EXP_DIR=/path/to/dev
@@ -25,7 +25,7 @@ mkdir -p "$RUNTIME_DIR"
 
 `DATA_DIR` 应包含 `dolma3_mix_50B-00000.jsonl.zst` 至 `00007.jsonl.zst`。已有压缩源文件直接使用，不写解压语料或 token 缓存。A评估使用已有 `dolma3_mix_100M_a.jsonl`。
 
-共享机器磁盘空间有限。运行前检查 `$RUNTIME_DIR` 所在磁盘的剩余空间，给完整 checkpoint 保存预留余量。开发只记录必要的配置、简洁日志、结果、成本和恢复校验摘要，不重复复制语料、tokenizer 或大文件。checkpoint 只保留当前恢复所需的最新完整状态，以及仍需验证的最终或候选状态；每档训练和验证结束后及时归档所需权重，再由运行负责人清理已被替代的 checkpoint。清理前确认没有作业或后续恢复依赖它，不删除其他人的文件；失败原因与成本记录仍保留。
+共享机器磁盘空间有限，运行前检查 `$RUNTIME_DIR` 所在磁盘的剩余空间。当前四档直接训练并评估内存中的最终权重，不保存 checkpoint；保留配置、逐步日志、结果和全部成本。中断后需从随机初始化重跑该档，失败与重跑成本均保留。评估缓存只创建一份，不重复复制语料、tokenizer 或大文件；不删除其他人的文件。
 
 只下载固定版本 tokenizer，不下载模型权重。镜像配置仅作用于当前终端；AutoDL需要加速时可先 `source /etc/network_turbo`（[说明](https://www.autodl.com/docs/network_turbo/)）：
 
@@ -75,34 +75,32 @@ export RUN_DIR="$RUNTIME_DIR/smoke-attempt01"
 bash recipes/qwen35-08b/train_qwen35_dp2.sh 300000000000000000 --smoke-steps 2
 ```
 
-正式四档串行运行，每档新目录，任何失败立即停止后续档：
+## 训练后直接验证
+
+A仅验证/选型，B不进入反馈。先准备完整A缓存；缓存只保存评估token和mask，不解压训练语料。首次使用新目录，后续各档复用同一缓存。
+
+```bash
+python -m eval.native prepare --dataset-path "$DATA_DIR/dolma3_mix_100M_a.jsonl" \
+  --tokenizer "$TOKENIZER_DIR" --cache-dir "$RUNTIME_DIR/eval-a-cache"
+```
+
+正式四档串行运行，每档新目录。`--no-checkpoints` 关闭保存，`--eval-cache` 在训练结束后直接用内存中的最终权重做完整A验证，复用训练的两个rank和进程组。任何训练或验证失败立即停止后续档：
 
 ```bash
 set -e
 for budget in 300000000000000000 1000000000000000000 3000000000000000000 10000000000000000000; do
   export RUN_DIR="$RUNTIME_DIR/qwen35-${budget}-seed20261011-attempt01"
-  bash recipes/qwen35-08b/train_qwen35_dp2.sh "$budget" > "$RUNTIME_DIR/qwen35-${budget}-attempt01.log" 2>&1
+  bash recipes/qwen35-08b/train_qwen35_dp2.sh "$budget" \
+    --no-checkpoints --eval-cache "$RUNTIME_DIR/eval-a-cache" \
+    > "$RUNTIME_DIR/qwen35-${budget}-attempt01.log" 2>&1
 done
 ```
 
-已有输出目录禁止覆盖。每档保存配置、环境、数据/tokenizer身份、逐步loss/成本、checkpoint及结果。完整恢复仍需新输出目录：在相同预算命令末尾添加 `--resume /path/to/own/checkpoint/stepN`。并行度、输入、microbatch、源码和调度必须保持一致，累计算量不会重置。固定seed保证可追溯，不能宣称bitwise相同。
+已有输出目录禁止覆盖。每档保存配置、环境、数据/tokenizer身份、逐步loss/成本和训练结果；评估覆盖、权重摘要及BPB写入 `$RUN_DIR/eval-a/`，不落盘权重。BPB使用完整A原始UTF-8分母；native耗时含CE，不是正式EvalTime。固定seed保证可追溯，不能宣称bitwise相同。
 
-## 完整A验证
+工程显存和吞吐校准可在前述 smoke 命令末尾加 `--no-checkpoints`，只跑声明的累计步数。正式无checkpoint运行必须提供完整A缓存，不能使用 `--resume`。
 
-A仅验证/选型，B不进入反馈。缓存只保存评估token和mask，不解压训练语料；首次创建新缓存目录，后续可复用。
-
-```bash
-python -m eval.native prepare --dataset-path "$DATA_DIR/dolma3_mix_100M_a.jsonl" \
-  --tokenizer "$TOKENIZER_DIR" --cache-dir "$RUNTIME_DIR/eval-a-cache"
-
-python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=2 \
-  --module eval.native evaluate --spec "$RUN_DIR/train.json" \
-  --checkpoint "$RUN_DIR/checkpoint/step55" --cache-dir "$RUNTIME_DIR/eval-a-cache" \
-  --output-dir "$RUNTIME_DIR/eval-a-attempt01" --sequence-length 8192 \
-  --batch-size 16 --loss-chunk-tokens 1024 --precision fp32-master-bf16
-```
-
-每档评估替换对应 `RUN_DIR`、checkpoint步数及新评估目录。BPB使用完整A原始UTF-8分母；native耗时含CE，不是正式EvalTime。部分评估不输出完整BPB。
+保留checkpoint的训练模式仍可使用，命令省略 `--no-checkpoints`。完整恢复需要新输出目录并添加 `--resume /path/to/own/checkpoint/stepN`；并行度、输入、microbatch、源码和调度必须保持一致，累计计算量不会重置。checkpoint训练的独立评估入口仍是 `python -m eval.native evaluate --help`；部分A不输出完整BPB。
 
 ## 已有四档结果
 
@@ -131,4 +129,4 @@ python -m recipes.qwen35-08b.train --help
 - `src/arch/`、`src/data/`、`src/train/`：模型、压缩流式数据和训练组件；数据读取所需的 tokenizer 辅助也在 `src/data/`。
 - `src/utils/megatron_budget.py`、`third_party/megatron/`：官方参考计算预算的适配器与原件。
 - `docs/`：本模型已有四档结果图与 JSONL。
-- `$RUNTIME_DIR/`：每次运行的日志、checkpoint、校准和失败证据，不加入 Git。
+- `$RUNTIME_DIR/`：每次运行的日志、评估结果、校准和失败证据，不加入 Git。当前四档不保存 checkpoint。

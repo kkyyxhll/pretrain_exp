@@ -37,6 +37,7 @@ from olmo_core.train.train_module.transformer.config import (
 from olmo_core.train.train_module.transformer.train_module import TransformerTrainModule
 from olmo_core.utils import prepare_cli_environment, seed_all
 
+from eval.native import evaluate_in_memory
 from src.arch.core.spec import spec_to_olmo
 from src.data.olmo_streaming import build_official_streaming_loader
 from src.train.config import TrainSpec
@@ -69,6 +70,8 @@ class TrainingArguments:
     plan: bool
     smoke_steps: int | None
     model: str = "qwen35"
+    no_checkpoints: bool = False
+    eval_cache: Path | None = None
 
 
 def arguments(argv: Sequence[str] | None = None) -> TrainingArguments:
@@ -85,11 +88,19 @@ def arguments(argv: Sequence[str] | None = None) -> TrainingArguments:
         "--plan", action="store_true", help="Print the budget plan without training"
     )
     parser.add_argument("--smoke-steps", type=int, help="Cumulative target 1..8; never a candidate")
+    parser.add_argument("--no-checkpoints", action="store_true", help="Keep weights only in memory")
+    parser.add_argument(
+        "--eval-cache", type=Path, help="Prepared full A cache for post-training evaluation"
+    )
     options = TrainingArguments(**vars(parser.parse_args(argv)))
     if options.output.exists() and int(os.environ.get("RANK", "0")) == 0:
         parser.error("Every attempt requires a fresh output directory")
     elif options.smoke_steps is not None and not 1 <= options.smoke_steps <= 8:
         parser.error("Engineering smoke is bounded to 1..8 cumulative steps")
+    elif options.no_checkpoints and options.resume:
+        parser.error("Checkpoint-free training cannot resume")
+    elif options.no_checkpoints and options.smoke_steps is None and options.eval_cache is None:
+        parser.error("Checkpoint-free formal training requires --eval-cache")
     else:
         return options
 
@@ -172,7 +183,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "formal_training": options.smoke_steps is None,
         "completed_new_updates": 0,
         "new_update_flops": 0,
+        "checkpoint_saved": False,
     }
+    training_finished = False
     if rank == 0:
         write_json(output_directory / "result.json", result)
     else:
@@ -241,6 +254,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             source_files_sha256=source_files,
             config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
             formal_training=options.smoke_steps is None,
+            checkpointing="disabled" if options.no_checkpoints else "full_native",
+            evaluation_cache=str(options.eval_cache) if options.eval_cache else None,
         )
         write_json(output_directory / "settings.json", settings)
         write_json(output_directory / "megatron-budget.json", budget)
@@ -373,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         train_module.num_flops_per_token = MethodType(megatron_per_token, train_module)
         trainer = TrainerConfig(
             save_folder=str(options.output / "checkpoint"),
+            no_checkpoints=options.no_checkpoints,
             load_strategy=LoadStrategy.never,
             max_duration=Duration.steps(target_steps),
             metrics_collect_interval=5,
@@ -394,6 +410,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             train_module=train_module,
             started_seconds=started_seconds,
             world_size=options.dp_world_size,
+            record_state_digests=not options.no_checkpoints,
         )
         trainer.add_callback("megatron_ledger", meter)
         if options.resume:
@@ -420,12 +437,37 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("Training ended before the declared target")
         else:
             pass
+        training_finished = True
+        result["training_completed_wall_seconds"] = time.monotonic() - started_seconds
+        if not options.no_checkpoints:
+            result["checkpoint_saved"] = True
+            result["final_checkpoint"] = str(options.output / "checkpoint" / f"step{target_steps}")
+        if options.eval_cache:
+            result["status"] = "evaluating"
+            write_json(output_directory / "result.json", result)
+            train_module.optim.zero_grad(set_to_none=True)
+            evaluation = evaluate_in_memory(
+                train_module.model,
+                options.output / "train.json",
+                options.eval_cache,
+                options.output / "eval-a",
+                training_step=trainer.global_step,
+                sequence_length=SEQUENCE_LENGTH,
+                batch_size=16,
+                loss_chunk_tokens=CE_CHUNK_TOKENS,
+            )
+            result["evaluation_bpb"] = evaluation.bpb
+            result["evaluation_output"] = str(options.output / "eval-a")
+            result["evaluation_elapsed_seconds"] = evaluation.elapsed_seconds
         result["status"] = "completed" if options.smoke_steps is None else "smoke_completed"
-        result["final_checkpoint"] = str(options.output / "checkpoint" / f"step{target_steps}")
     except BaseException:
         result["status"] = "failed"
         result["error"] = traceback.format_exc()
-        result["partial_failed_update_flops"] = "unknown; completed updates are a lower bound"
+        result["partial_failed_update_flops"] = (
+            "none; training finished before evaluation failure"
+            if training_finished
+            else "unknown; completed updates are a lower bound"
+        )
         raise
     finally:
         result["wall_seconds"] = time.monotonic() - started_seconds

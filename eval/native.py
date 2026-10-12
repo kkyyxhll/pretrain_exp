@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.distributed as distributed
 import torch.nn.functional as functional
+from olmo_core.nn.transformer import Transformer
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from eval.checkpoint import (
@@ -38,6 +39,7 @@ from eval.checkpoint import (
 )
 from eval.official import eval as official_evaluator
 from src.data.olmo_streaming import HFStreamingTokenizer
+from src.train.loss import ChunkedLMHead
 
 __all__ = [
     "evaluation_autocast",
@@ -56,6 +58,7 @@ __all__ = [
     "saved_training_spec",
     "load_model",
     "evaluate",
+    "evaluate_in_memory",
     "main",
 ]
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +68,7 @@ MAX_SEQUENCE_LENGTH = 8192
 CE_PARITY_PREFIX_TOKENS = 128
 CE_PARITY_TOLERANCE = 1e-5
 PROGRESS_INTERVAL_BATCHES = 10
+WEIGHT_DIGEST_CHUNK_ELEMENTS = 4 * 1024 * 1024
 
 
 @dataclass(kw_only=True)
@@ -81,7 +85,7 @@ class EvaluationRecord:
     """Record the selected inputs, precision and fixed-weight evaluation scope."""
 
     spec: str
-    checkpoint: str
+    checkpoint: str | None
     cache_metadata: CacheMetadata
     world_size: int
     batch_size: int
@@ -94,6 +98,9 @@ class EvaluationRecord:
     unique_parameters: int
     full_logits_ce_parity_max_error: float
     evaluator_commit: str
+    weight_source: Literal["checkpoint", "in_memory"] = "checkpoint"
+    training_step: int | None = None
+    weights_sha256: str | None = None
     compute_dtype: Literal["bfloat16"] = "bfloat16"
     model_training: Literal[False] = False
     gradients_enabled: Literal[False] = False
@@ -117,7 +124,7 @@ class EvaluationResult:
     """Report fixed-weight loss; complete BPB requires full dataset coverage."""
 
     full_dataset: bool
-    checkpoint: str
+    checkpoint: str | None
     precision_mode: PrecisionMode
     nll_nats: float
     scored_tokens: int
@@ -126,6 +133,9 @@ class EvaluationResult:
     bpb: float | None
     elapsed_seconds: float
     peak_device_memory_bytes: int
+    weight_source: Literal["checkpoint", "in_memory"] = "checkpoint"
+    training_step: int | None = None
+    weights_sha256: str | None = None
     status: Literal["complete"] = "complete"
     official_evaltime: None = None
 
@@ -224,16 +234,101 @@ def token_nll(losses: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 
 
 def evaluate(options: EvaluateOptions) -> None:
+    """Load a saved checkpoint and own the standalone evaluation process group."""
+    resolved_device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+    torch.cuda.set_device(resolved_device)
+    model, storage_dtypes = load_model(options, resolved_device)
+    distributed.init_process_group("nccl", device_id=resolved_device, timeout=timedelta(minutes=20))
+    try:
+        _evaluate_model(model, options, storage_dtypes=storage_dtypes)
+    finally:
+        distributed.destroy_process_group()
+
+
+def weight_digest(model: Transformer) -> str:
+    """Identify actual in-memory parameters without writing any weight tensors."""
+    digest = hashlib.sha256()
+    for parameter_name, parameter in model.named_parameters():
+        header = (parameter_name, tuple(parameter.shape), str(parameter.dtype))
+        digest.update((json.dumps(header) + "\n").encode())
+        for chunk in parameter.detach().flatten().split(WEIGHT_DIGEST_CHUNK_ELEMENTS):
+            digest.update(chunk.cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def evaluate_in_memory(
+    model: Transformer,
+    spec_path: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    *,
+    training_step: int,
+    sequence_length: int = 8192,
+    batch_size: int = 16,
+    loss_chunk_tokens: int = 1024,
+) -> EvaluationResult:
+    """Evaluate final training weights using the existing data-parallel process group."""
+    if not distributed.is_initialized():
+        raise RuntimeError("In-memory evaluation requires the existing training process group")
+    if training_step < 1:
+        raise ValueError("In-memory evaluation requires a completed training step")
+    parameter_dtypes = {parameter.dtype for parameter in model.parameters()}
+    if parameter_dtypes != {torch.float32}:
+        raise ValueError("In-memory evaluation requires original FP32 master parameters")
+    if (
+        not isinstance(model.lm_head, ChunkedLMHead)
+        or model.lm_head.chunk_tokens != loss_chunk_tokens
+    ):
+        raise ValueError("In-memory evaluation must retain the training chunked CE head")
+    model_weights_sha256 = weight_digest(model)
+    rank_weight_digests: list[str | None] = [None] * distributed.get_world_size()
+    distributed.all_gather_object(rank_weight_digests, model_weights_sha256)
+    if any(rank_digest != model_weights_sha256 for rank_digest in rank_weight_digests):
+        raise RuntimeError("In-memory weights differ between training ranks")
+    options = EvaluateOptions(
+        spec=spec_path,
+        checkpoint=None,
+        cache_dir=cache_dir,
+        output_dir=output_dir,
+        sequence_length=sequence_length,
+        batch_size=batch_size,
+        loss_chunk_tokens=loss_chunk_tokens,
+        max_batches=None,
+        precision="fp32-master-bf16",
+    )
+    was_training = model.training
+    model.eval()
+    try:
+        return _evaluate_model(
+            model,
+            options,
+            storage_dtypes=[],
+            training_step=training_step,
+            weights_sha256=model_weights_sha256,
+        )
+    finally:
+        model.train(was_training)
+
+
+def _evaluate_model(
+    model: Transformer,
+    options: EvaluateOptions,
+    *,
+    storage_dtypes: list[str],
+    training_step: int | None = None,
+    weights_sha256: str | None = None,
+) -> EvaluationResult:
     """Evaluate fixed weights with complete text-token coverage and original bytes."""
     if not 1 <= options.sequence_length <= MAX_SEQUENCE_LENGTH or options.batch_size < 1:
         raise ValueError("invalid sequence length or batch size")
     elif options.max_batches is not None and options.max_batches < 1:
         raise ValueError("max-batches must be positive")
     else:
-        rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-    resolved_device = torch.device("cuda", rank)
-    torch.cuda.set_device(resolved_device)
+        rank = distributed.get_rank()
+        world_size = distributed.get_world_size()
+    resolved_device = next(model.parameters()).device
+    if resolved_device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(resolved_device)
     if rank == 0:
         check_protocol()
         options.output_dir.mkdir(parents=True, exist_ok=False)
@@ -255,9 +350,10 @@ def evaluate(options: EvaluateOptions) -> None:
     text_mask = np.memmap(options.cache_dir / "is_text.bin", dtype=np.bool_, mode="r")
     if len(tokens) != len(text_mask) or int(text_mask.sum()) != metadata["total_tokens"]:
         raise ValueError("packed cache lengths or text-token count differ")
-    else:
-        model, storage_dtypes = load_model(options, resolved_device)
-    distributed.init_process_group("nccl", device_id=resolved_device, timeout=timedelta(minutes=20))
+    checkpoint_label = path_label(options.checkpoint) if options.checkpoint is not None else None
+    weight_source = "checkpoint" if options.checkpoint is not None else "in_memory"
+    # note (kkyyxhll): Uneven evaluation tails must bypass composable DDP root sync hooks.
+    forward = model.forward if options.checkpoint is None else model
     evaluator = official_module()
     num_sequences = math.ceil((len(tokens) - 1) / options.sequence_length)
     all_steps = math.ceil(num_sequences / (options.batch_size * world_size))
@@ -273,11 +369,11 @@ def evaluate(options: EvaluateOptions) -> None:
 
     with torch.inference_mode(), evaluation_autocast(options.precision, resolved_device):
         input_ids, labels = batch(0, 1, min(CE_PARITY_PREFIX_TOKENS, options.sequence_length))
-        logits = model(input_ids)
+        logits = forward(input_ids)
         reference_losses = functional.cross_entropy(
             logits.float().flatten(0, 1), labels.flatten(), ignore_index=-100, reduction="none"
         ).reshape_as(labels)
-        actual_losses = model(
+        actual_losses = forward(
             input_ids, labels=labels, loss_reduction="none", return_logits=False
         ).ce_loss
         torch.testing.assert_close(
@@ -288,7 +384,7 @@ def evaluate(options: EvaluateOptions) -> None:
     distributed.barrier()
     run_metadata = EvaluationRecord(
         spec=path_label(options.spec),
-        checkpoint=path_label(options.checkpoint),
+        checkpoint=checkpoint_label,
         cache_metadata=metadata,
         world_size=world_size,
         batch_size=options.batch_size,
@@ -301,11 +397,14 @@ def evaluate(options: EvaluateOptions) -> None:
         unique_parameters=sum(parameter.numel() for parameter in model.parameters()),
         full_logits_ce_parity_max_error=parity_max_error,
         evaluator_commit=source_commit(),
+        weight_source=weight_source,
+        training_step=training_step,
+        weights_sha256=weights_sha256,
     )
     if rank == 0:
         write_json(options.output_dir / "run_meta.json", run_metadata)
         LOGGER.info(
-            f"Loaded trained checkpoint; {num_sequences} sequences, {steps} batches; CE parity error={parity_max_error}"
+            f"Evaluating fixed weights; {num_sequences} sequences, {steps} batches; CE parity error={parity_max_error}"
         )
     else:
         pass
@@ -319,7 +418,7 @@ def evaluate(options: EvaluateOptions) -> None:
             )
             if start_sequence < stop_sequence:
                 input_ids, labels = batch(start_sequence, stop_sequence, options.sequence_length)
-                loss_output = model(
+                loss_output = forward(
                     input_ids, labels=labels, loss_reduction="none", return_logits=False
                 )
                 total_nll += token_nll(loss_output.ce_loss, labels)
@@ -353,7 +452,7 @@ def evaluate(options: EvaluateOptions) -> None:
         pass
     result = EvaluationResult(
         full_dataset=is_full_dataset,
-        checkpoint=path_label(options.checkpoint),
+        checkpoint=checkpoint_label,
         precision_mode=options.precision,
         nll_nats=float(total_nll),
         scored_tokens=int(scored_token_count),
@@ -361,7 +460,14 @@ def evaluate(options: EvaluateOptions) -> None:
         original_utf8_bytes=metadata["total_bytes"] if is_full_dataset else None,
         bpb=float(total_nll) / (math.log(2) * metadata["total_bytes"]) if is_full_dataset else None,
         elapsed_seconds=time.perf_counter() - started_seconds,
-        peak_device_memory_bytes=torch.cuda.max_memory_allocated(resolved_device),
+        peak_device_memory_bytes=(
+            torch.cuda.max_memory_allocated(resolved_device)
+            if resolved_device.type == "cuda"
+            else 0
+        ),
+        weight_source=weight_source,
+        training_step=training_step,
+        weights_sha256=weights_sha256,
     )
     if not math.isfinite(result.ce_nats_per_token):
         raise RuntimeError("non-finite evaluation result")
@@ -371,7 +477,7 @@ def evaluate(options: EvaluateOptions) -> None:
     else:
         pass
     distributed.barrier()
-    distributed.destroy_process_group()
+    return result
 
 
 def main(argv: list[str] | None = None) -> None:

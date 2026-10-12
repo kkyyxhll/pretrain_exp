@@ -30,7 +30,7 @@ class EvaluateOptions:
     """Hold the complete fixed-weight evaluation configuration."""
 
     spec: Path
-    checkpoint: Path
+    checkpoint: Path | None
     cache_dir: Path
     output_dir: Path
     sequence_length: int
@@ -177,6 +177,8 @@ def saved_training_spec(checkpoint: Path) -> Path:
 
 def load_model(options: EvaluateOptions, device: torch.device) -> tuple[Transformer, list[str]]:
     """Load only the trained model tensors while retaining FP32 master values."""
+    if options.checkpoint is None:
+        raise ValueError("Checkpoint evaluation requires a checkpoint path")
     spec_data: object = json.loads(options.spec.read_text())
     saved_spec_data: object = json.loads(saved_training_spec(options.checkpoint).read_text())
     if not isinstance(spec_data, dict) or not isinstance(saved_spec_data, dict):
