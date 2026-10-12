@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal
 
+import torch
 from olmo_core.config import DType
 from olmo_core.nn.attention import (
+    Attention,
     AttentionConfig,
     AttentionType,
     GateConfig,
@@ -14,61 +16,57 @@ from olmo_core.nn.attention import (
     SlidingWindowAttentionConfig,
 )
 from olmo_core.nn.attention.backend import AttentionBackendName
+from olmo_core.nn.attention.base import SequenceMixer
+from olmo_core.nn.buffer_cache import BufferCache
 from olmo_core.nn.rope import RoPEConfig
 
-from ..core.registry import register
-
-__all__ = ["FullAttentionConfig"]
+from src.arch.norm.rms import RmsNormConfig
 
 
-@register("attn", "full")
-@dataclass
+@dataclass(kw_only=True)
 class FullAttentionConfig(AttentionConfig):
-    """可搜索超参：n_heads / n_kv_heads / head_dim / qk_norm / fused / backend / rope_theta / window。
-
-    GQA = ``n_kv_heads < n_heads``（需整除）；MHA = 相等或 None。
-    ``window`` 由 spec.py 按层注入（None = 全局因果），实现为逐层滑动窗口。
-    """
+    """Configure full attention while retaining serialized parameter names."""
 
     n_heads: int = 16
-    n_kv_heads: Optional[int] = None
-    head_dim: Optional[int] = None
+    n_kv_heads: int | None = None
+    head_dim: int | None = None
     qk_norm: bool = False
-    use_head_qk_norm: bool = False  # True = q/k norm 逐头（Qwen3 系：norm 维度 = head_dim）
-    qk_norm_kind: str = "rms"  # rms | qwen (Qwen3) | qwen35 (unit offset)
-    qk_norm_eps: Optional[float] = None
-    gate: bool = False  # True = 输出门（Qwen3 系 attn_output_gate，elementwise 粒度）
+    use_head_qk_norm: bool = False
+    qk_norm_kind: Literal["rms", "qwen", "qwen35"] = "rms"
+    qk_norm_eps: float | None = None
+    gate: bool = False
     gate_full_precision: bool = True
     bias: bool = False
-    qkv_bias: bool = False  # True = 仅 q/k/v 投影带 bias（Qwen2 系约定，o_proj 无 bias）
-    fused: bool = False  # True → OLMo fused_v2（packed QKV）
-    backend: Optional[str] = None  # None → OLMo 自动选择（CPU 回退 torch）
+    qkv_bias: bool = False
+    fused: bool = False
+    backend: (
+        AttentionBackendName | Literal["torch", "flash_2", "flash_3", "flash_4", "te"] | None
+    ) = None
     rope_theta: float = 10000.0
-    rope_full_precision: bool = False  # True = fp32 rope（OLMo 默认），False = 跟随输入 dtype
-    partial_rotary_factor: float = 1.0  # <1 只对前若干维施 rope（Qwen3.5 用 0.25）
-    window: Optional[int] = None
+    rope_full_precision: bool = False
+    partial_rotary_factor: float = 1.0
+    window: int | None = None
 
     def to_olmo(self) -> AttentionConfig:
-        from ..norm.rms import RmsNormConfig
-
         if self.qk_norm_kind not in ("rms", "qwen", "qwen35"):
             raise ValueError(f"unsupported qk_norm_kind: {self.qk_norm_kind}")
-        qk_config = (
-            RmsNormConfig(
-                qwen=self.qk_norm_kind == "qwen",
-                unit_offset=self.qk_norm_kind == "qwen35",
-                eps=self.qk_norm_eps,
-            ).to_olmo()
-            if self.qk_norm
-            else None
-        )
+        else:
+            query_key_norm = (
+                RmsNormConfig(
+                    qwen=self.qk_norm_kind == "qwen",
+                    unit_offset=self.qk_norm_kind == "qwen35",
+                    eps=self.qk_norm_eps,
+                ).to_olmo()
+                if self.qk_norm
+                else None
+            )
         return AttentionConfig(
             name=AttentionType.fused_v2 if self.fused else AttentionType.default,
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             head_dim=self.head_dim,
             bias=self.bias,
-            qk_norm=qk_config,
+            qk_norm=query_key_norm,
             use_head_qk_norm=self.use_head_qk_norm,
             gate=GateConfig(
                 granularity=GateGranularity.elementwise, full_precision=self.gate_full_precision
@@ -94,28 +92,39 @@ class FullAttentionConfig(AttentionConfig):
         )
 
     def num_params(self, d_model: int) -> int:
-        total = self.to_olmo().num_params(d_model)
+        parameter_count = self.to_olmo().num_params(d_model)
         if self.qkv_bias and not self.bias:
-            hd = self.head_dim if self.head_dim is not None else d_model // self.n_heads
-            n_kv = self.n_kv_heads if self.n_kv_heads is not None else self.n_heads
-            total += self.n_heads * hd + 2 * n_kv * hd  # 注入的 q/k/v bias
-        return total
+            head_channels = self.head_dim if self.head_dim is not None else d_model // self.n_heads
+            key_value_head_count = self.n_kv_heads if self.n_kv_heads is not None else self.n_heads
+            parameter_count += (
+                self.n_heads * head_channels + 2 * key_value_head_count * head_channels
+            )
+        else:
+            pass
+        return parameter_count
 
     def build(
-        self, d_model: int, *, layer_idx: int, n_layers: int, init_device: str = "cpu", cache=None
-    ):
-        m = self.to_olmo().build(
+        self,
+        d_model: int,
+        *,
+        layer_idx: int,
+        n_layers: int,
+        init_device: str = "cpu",
+        cache: BufferCache | None = None,
+    ) -> SequenceMixer:
+        attention = self.to_olmo().build(
             d_model, layer_idx=layer_idx, n_layers=n_layers, init_device=init_device, cache=cache
         )
         if self.qkv_bias and not self.bias:
-            # Qwen2 系约定：q/k/v 带 bias、o_proj 无。OLMo AttentionConfig 只有一个全局
-            # bias 开关，因此按 bias=False 构建后向 q/k/v 的 Linear 注入 bias 参数
-            # （nn.Linear 语义：bias 参数非 None 即参与前向）。
-            import torch
-
-            for name in ("w_q", "w_k", "w_v"):
-                lin = getattr(m, name)
-                lin.bias = torch.nn.Parameter(
-                    torch.zeros(lin.out_features, device=lin.weight.device, dtype=lin.weight.dtype)
+            assert isinstance(attention, Attention)
+            for projection in (attention.w_q, attention.w_k, attention.w_v):
+                projection.bias = torch.nn.Parameter(
+                    torch.zeros(
+                        projection.out_features,
+                        device=projection.weight.device,
+                        dtype=projection.weight.dtype,
+                    )
                 )
-        return m
+        else:
+            pass
+        return attention

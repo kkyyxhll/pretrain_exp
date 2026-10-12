@@ -1,6 +1,3 @@
-import sys
-from pathlib import Path
+"""Select the bundled training backend for project tests."""
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT), str(ROOT / "src")]
-import third_party as third_party  # isort: skip
+import third_party as third_party

@@ -11,11 +11,11 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
-# Calibrated single-node container route; override only after a passing P2P check.
+# Use the calibrated container route until an independent P2P check passes.
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 exec python -m torch.distributed.run \
   --standalone --nnodes=1 --nproc-per-node=2 \
-  recipes/qwen35-08b/train.py \
+  --module recipes.qwen35-08b.train \
   --dp-world-size 2 --budget "$budget" \
   --data-dir "$DATA_DIR" --tokenizer-dir "$TOKENIZER_DIR" \
   --output "$RUN_DIR" "$@"

@@ -63,7 +63,7 @@ PY
 只打印计划，不启动GPU：
 
 ```bash
-python recipes/qwen35-08b/train.py --budget 300000000000000000 \
+python -m recipes.qwen35-08b.train --budget 300000000000000000 \
   --data-dir "$DATA_DIR" --tokenizer-dir "$TOKENIZER_DIR" \
   --output "$RUNTIME_DIR/plan-unused" --plan
 ```
@@ -92,11 +92,11 @@ done
 A仅验证/选型，B不进入反馈。缓存只保存评估token和mask，不解压训练语料；首次创建新缓存目录，后续可复用。
 
 ```bash
-python eval/native.py prepare --dataset-path "$DATA_DIR/dolma3_mix_100M_a.jsonl" \
+python -m eval.native prepare --dataset-path "$DATA_DIR/dolma3_mix_100M_a.jsonl" \
   --tokenizer "$TOKENIZER_DIR" --cache-dir "$RUNTIME_DIR/eval-a-cache"
 
 python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=2 \
-  eval/native.py evaluate --spec "$RUN_DIR/train.json" \
+  --module eval.native evaluate --spec "$RUN_DIR/train.json" \
   --checkpoint "$RUN_DIR/checkpoint/step55" --cache-dir "$RUNTIME_DIR/eval-a-cache" \
   --output-dir "$RUNTIME_DIR/eval-a-attempt01" --sequence-length 8192 \
   --batch-size 16 --loss-chunk-tokens 1024 --precision fp32-master-bf16
@@ -120,7 +120,7 @@ python -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=2 \
 python -m pytest tests -q
 pre-commit run --all-files
 git diff --check
-python recipes/qwen35-08b/train.py --help
+python -m recipes.qwen35-08b.train --help
 ```
 
 首次提交前由维护者先 `git add .`，再运行 `pre-commit run --all-files`；空索引不能检查尚未加入 Git 的文件。若格式工具修改了文件，检查改动、重新暂存并再次运行，全部通过后再提交。

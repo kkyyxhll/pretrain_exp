@@ -1,4 +1,4 @@
-"""Qwen3.5 architecture specifications and OLMo configuration translation."""
+"""Qwen3.5 specifications and concrete OLMo configuration translation."""
 
 from __future__ import annotations
 
@@ -6,355 +6,362 @@ import dataclasses
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Literal
 
 from olmo_core.config import DType
 from olmo_core.nn.lm_head import LMHeadConfig
-from olmo_core.nn.transformer.config import (
-    TransformerBlockConfig,
-    TransformerBlockType,
-    TransformerConfig,
-)
+from olmo_core.nn.transformer import Transformer
+from olmo_core.nn.transformer.config import TransformerBlockConfig, TransformerConfig
 from olmo_core.nn.transformer.init import InitMethod
 
-from .registry import ArchError, get_config
+from src.arch.attn.full import FullAttentionConfig
+from src.arch.attn.qwen35_gdn import Qwen35GDNConfig
+from src.arch.ffn.swiglu import SwigluConfig
+from src.arch.norm.rms import RmsNormConfig
 
-__all__ = [
-    "LayerSpec",
-    "ArchSpec",
-    "pattern_to_layers",
-    "spec_to_olmo",
-    "build_model",
-    "spec_num_params",
-]
-
-_FIELD_KEYS = {"attn", "ffn", "norm", "res", "placement", "window"}
-_KWARGS_GROUPS = {"attn", "ffn", "norm"}
+ConfigScalar = bool | int | float | str | None
+ConfigOptions = dict[str, ConfigScalar]
 
 
-@dataclass
+LayerPayload = dict[str, ConfigScalar | ConfigOptions]
+ArchPayload = dict[str, ConfigScalar | ConfigOptions | list[LayerPayload]]
+
+
+class ArchError(Exception):
+    """Invalid architecture fields or unsupported components."""
+
+
+def config_options(payload: object) -> ConfigOptions:
+    """Validate scalar configuration values at a JSON boundary."""
+    if not isinstance(payload, dict):
+        raise ArchError("component options must be a mapping")
+    else:
+        options: ConfigOptions = {}
+        for option_name, option_value in payload.items():
+            if not isinstance(option_name, str):
+                raise ArchError("component option names must be strings")
+            elif option_value is None or isinstance(option_value, (bool, int, float, str)):
+                options[option_name] = option_value
+            else:
+                raise ArchError(f"invalid scalar component option: {option_name}")
+        return options
+
+
+@dataclass(kw_only=True)
 class LayerSpec:
-    """一层 = 一个变体组合：attn/ffn/norm 的名字 + 残差缩放 + placement + window。"""
+    """One layer's components and residual scaling, with stable serialized keys."""
 
-    attn: str = "full"
-    ffn: str = "swiglu"
-    norm: str = "rms"
-    res_alpha: float = 1.0  # 残差缩放（1.0 = 恒等）
-    placement: str = "pre"  # v1 仅 pre；post/peri 需自定义 block 类型
-    window: Optional[int] = None  # None = 全局因果
-    attn_kwargs: Dict[str, Any] = field(default_factory=dict)
-    ffn_kwargs: Dict[str, Any] = field(default_factory=dict)
-    norm_kwargs: Dict[str, Any] = field(default_factory=dict)
+    attn: Literal["full", "qwen35_gdn"] = "full"
+    ffn: Literal["swiglu"] = "swiglu"
+    norm: Literal["rms"] = "rms"
+    res_alpha: float = 1.0
+    placement: Literal["pre", "post"] = "pre"
+    window: int | None = None
+    attn_kwargs: ConfigOptions = field(default_factory=dict)
+    ffn_kwargs: ConfigOptions = field(default_factory=dict)
+    norm_kwargs: ConfigOptions = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.placement not in ("pre", "post"):
-            raise ArchError(f"placement 仅支持 pre/post: {self.placement!r}")
+            raise ArchError(f"unsupported placement: {self.placement!r}")
+        else:
+            pass
         if self.window is not None and not isinstance(self.window, int):
-            raise ArchError(f"window 必须为 None 或 int: {self.window!r}")
+            raise ArchError(f"window must be None or int: {self.window!r}")
+        else:
+            pass
         if not isinstance(self.res_alpha, (int, float)) or self.res_alpha <= 0:
-            raise ArchError(f"res 必须为正数: {self.res_alpha!r}")
+            raise ArchError(f"res must be positive: {self.res_alpha!r}")
+        else:
+            pass
+
+    @classmethod
+    def from_dict(cls, serialized_layer: Mapping[str, object]) -> LayerSpec:
+        unknown_fields = set(serialized_layer) - {entry.name for entry in dataclasses.fields(cls)}
+        if unknown_fields:
+            raise ArchError(f"unknown layer fields: {sorted(unknown_fields)}")
+        else:
+            scalar_values = config_options(
+                {
+                    name: value
+                    for name, value in serialized_layer.items()
+                    if not name.endswith("_kwargs")
+                }
+            )
+            return cls(
+                **scalar_values,
+                attn_kwargs=config_options(serialized_layer.get("attn_kwargs", {})),
+                ffn_kwargs=config_options(serialized_layer.get("ffn_kwargs", {})),
+                norm_kwargs=config_options(serialized_layer.get("norm_kwargs", {})),
+            )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ArchSpec:
-    """一份完整架构描述。layers 长度必须等于 n_layers。"""
+    """Complete architecture with stable serialized dimension and layer keys."""
 
     vocab_size: int
     d_model: int
     n_layers: int
     rope_theta: float = 10000.0
-    dtype: str = "bfloat16"
+    dtype: Literal["float32", "bfloat16", "float16"] = "bfloat16"
     tie_word_embeddings: bool = True
-    init_method: str = "normal"
+    init_method: Literal["normal", "llama", "llama_depth", "normalized", "fan_in"] = "normal"
     init_std: float = 0.02
-    final_norm: str = "rms"
-    final_norm_kwargs: Dict[str, Any] = field(default_factory=dict)
-    layers: List[LayerSpec] = field(default_factory=list)
+    final_norm: Literal["rms"] = "rms"
+    final_norm_kwargs: ConfigOptions = field(default_factory=dict)
+    layers: list[LayerSpec] = field(default_factory=list)
 
-    def __post_init__(self):
-        for k, v in (
+    def __post_init__(self) -> None:
+        for dimension_name, dimension_count in (
             ("vocab_size", self.vocab_size),
             ("d_model", self.d_model),
             ("n_layers", self.n_layers),
         ):
-            if not isinstance(v, int) or v <= 0:
-                raise ArchError(f"{k} 必须为正整数: {v!r}")
+            if not isinstance(dimension_count, int) or dimension_count <= 0:
+                raise ArchError(f"{dimension_name} must be a positive integer: {dimension_count!r}")
+            else:
+                pass
         if self.layers and len(self.layers) != self.n_layers:
-            raise ArchError(f"layers 数 {len(self.layers)} != n_layers {self.n_layers}")
+            raise ArchError(f"layer count {len(self.layers)} != n_layers {self.n_layers}")
+        else:
+            pass
 
-    # -- 序列化 ------------------------------------------------------------
-    def to_dict(self) -> dict:
-        d = dataclasses.asdict(self)
-        d["layers"] = [dataclasses.asdict(layer) for layer in self.layers]
-        return d
+    def to_dict(self) -> ArchPayload:
+        return dataclasses.asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ArchSpec":
-        known = {f.name for f in dataclasses.fields(cls)}
-        unknown = set(d) - known
-        if unknown:
-            raise ArchError(f"ArchSpec 未知字段: {sorted(unknown)}")
-        lknown = {f.name for f in dataclasses.fields(LayerSpec)}
-        layers = []
-        for i, ld in enumerate(d.get("layers", [])):
-            lunknown = set(ld) - lknown
-            if lunknown:
-                raise ArchError(f"layers[{i}] 未知字段: {sorted(lunknown)}")
-            layers.append(LayerSpec(**ld))
-        return cls(**{k: v for k, v in d.items() if k != "layers"}, layers=layers)
+    def from_dict(cls, serialized_spec: Mapping[str, object]) -> ArchSpec:
+        unknown_fields = set(serialized_spec) - {entry.name for entry in dataclasses.fields(cls)}
+        if unknown_fields:
+            raise ArchError(f"unknown architecture fields: {sorted(unknown_fields)}")
+        else:
+            pass
+        serialized_layers = serialized_spec.get("layers", [])
+        if not isinstance(serialized_layers, list):
+            raise ArchError("layers must be a list")
+        else:
+            layers: list[LayerSpec] = []
+            for layer_index, serialized_layer in enumerate(serialized_layers):
+                if not isinstance(serialized_layer, dict):
+                    raise ArchError(f"layers[{layer_index}] must be a mapping")
+                else:
+                    layers.append(LayerSpec.from_dict(serialized_layer))
+        scalar_values = config_options(
+            {
+                name: value
+                for name, value in serialized_spec.items()
+                if name not in ("layers", "final_norm_kwargs")
+            }
+        )
+        return cls(
+            **scalar_values,
+            final_norm_kwargs=config_options(serialized_spec.get("final_norm_kwargs", {})),
+            layers=layers,
+        )
 
     def hash(self) -> str:
-        """spec 内容哈希（与 dict 顺序无关），用作实验 ID。"""
         return hashlib.sha256(self.to_json().encode("utf-8")).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# pattern DSL
-# ---------------------------------------------------------------------------
+ASSIGNMENT_PATTERN: re.Pattern[str] = re.compile(
+    r"^\s*(?P<assign>[^@*;]+?)\s*(?:\*\s*(?P<rep>\d+))?\s*$"
+)
+LAYER_RANGE_PATTERN: re.Pattern[str] = re.compile(
+    r"^\s*(?P<assign>[^@*;]+?)\s*@\s*(?P<targets>[\d\-,]+)\s*$"
+)
+LAYER_ASSIGNMENT_FIELDS: set[str] = {"attn", "ffn", "norm", "res", "placement", "window"}
+COMPONENT_GROUPS: set[str] = {"attn", "ffn", "norm"}
 
-_ASSIGN_RE = re.compile(r"^\s*(?P<assign>[^@*;]+?)\s*(?:\*\s*(?P<rep>\d+))?\s*$")
-_RANGE_RE = re.compile(r"^\s*(?P<assign>[^@*;]+?)\s*@\s*(?P<targets>[\d\-,]+)\s*$")
 
-
-def _parse_value(v: str) -> Any:
-    v = v.strip()
-    if v in ("none", "None", ""):
+def parse_value(value_text: str) -> ConfigScalar:
+    value_text = value_text.strip()
+    if value_text in ("none", "None", ""):
         return None
-    if v in ("true", "True"):
+    elif value_text in ("true", "True"):
         return True
-    if v in ("false", "False"):
+    elif value_text in ("false", "False"):
         return False
-    try:
-        return int(v)
-    except ValueError:
-        pass
-    try:
-        return float(v)
-    except ValueError:
-        pass
-    return v
+    else:
+        try:
+            return int(value_text)
+        except ValueError:
+            try:
+                return float(value_text)
+            except ValueError:
+                return value_text
 
 
-def _parse_assign(assign: str) -> Dict[str, Any]:
-    """解析一条赋值 → {字段名: 值} ∪ {kwargs 组: {k: v}}。"""
-    assign = assign.strip()
-    if assign in ("", "default"):
-        return {}
-    out: Dict[str, Any] = {}
-    for part in assign.split(","):
-        part = part.strip()
-        if not part:
+def assign_layer(base_layer: LayerSpec, assignment_text: str) -> LayerSpec:
+    layer_fields: LayerPayload = dataclasses.asdict(base_layer)
+    assignments = [] if assignment_text.strip() in ("", "default") else assignment_text.split(",")
+    for assignment in assignments:
+        assignment = assignment.strip()
+        if not assignment:
             continue
-        if "=" not in part:
-            raise ArchError(f"赋值项缺少 '=': {part!r}（完整语句: {assign!r}）")
-        k, v = part.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if "." in k:
-            group, kk = k.split(".", 1)
-            if group not in _KWARGS_GROUPS:
-                raise ArchError(f"点号键仅支持 {sorted(_KWARGS_GROUPS)}: {k!r}")
-            out.setdefault(f"{group}_kwargs", {})[kk] = _parse_value(v)
-            continue
-        if k not in _FIELD_KEYS:
-            raise ArchError(
-                f"未知赋值键 {k!r}，可用: {sorted(_FIELD_KEYS)} 或 {'/'.join(sorted(_KWARGS_GROUPS))}.<超参>"
-            )
-        if k == "res":
-            out["res_alpha"] = float(v)
-        elif k == "window":
-            val = _parse_value(v)
-            out[k] = None if val is None else int(val)
+        elif "=" not in assignment:
+            raise ArchError(f"assignment is missing '=': {assignment!r}")
         else:
-            out[k] = _parse_value(v)
-    return out
-
-
-def _merge(base: LayerSpec, over: Dict[str, Any]) -> LayerSpec:
-    d = dataclasses.asdict(base)
-    for k, v in over.items():
-        if k.endswith("_kwargs"):
-            d[k].update(v)
+            field_name, value_text = (part.strip() for part in assignment.split("=", 1))
+        if "." in field_name:
+            component_group, option_name = field_name.split(".", 1)
+            if component_group not in COMPONENT_GROUPS:
+                raise ArchError(f"unsupported component group: {component_group!r}")
+            else:
+                layer_fields[f"{component_group}_kwargs"][option_name] = parse_value(value_text)
+        elif field_name not in LAYER_ASSIGNMENT_FIELDS:
+            raise ArchError(f"unknown assignment field: {field_name!r}")
+        elif field_name == "res":
+            layer_fields["res_alpha"] = float(value_text)
+        elif field_name == "window":
+            parsed_value = parse_value(value_text)
+            layer_fields["window"] = None if parsed_value is None else int(parsed_value)
         else:
-            d[k] = v
-    return LayerSpec(**d)
+            layer_fields[field_name] = parse_value(value_text)
+    return LayerSpec.from_dict(layer_fields)
 
 
-def pattern_to_layers(pattern: str, n_layers: int) -> List[LayerSpec]:
-    """把紧凑 pattern 展开为逐层 LayerSpec 列表，长度必须恰为 n_layers。"""
-    base = LayerSpec()
-    layers: List[Optional[LayerSpec]] = [None] * n_layers
-    pos = 0
-    for stmt in pattern.split(";"):
-        stmt = stmt.strip()
-        if not stmt:
+def pattern_to_layers(pattern: str, n_layers: int) -> list[LayerSpec]:
+    """Expand repeated component assignments and layer-index overrides."""
+    base_layer = LayerSpec()
+    layers: list[LayerSpec | None] = [None] * n_layers
+    next_layer_index = 0
+    for statement in pattern.split(";"):
+        statement = statement.strip()
+        if not statement:
             continue
-        m = _RANGE_RE.match(stmt)
-        if m:
-            idxs = []
-            for part in m.group("targets").split(","):
-                if "-" in part:
-                    lo_s, hi_s = part.split("-", 1)
-                    idxs.extend(range(int(lo_s), int(hi_s) + 1))
+        else:
+            pass
+        range_match = LAYER_RANGE_PATTERN.match(statement)
+        if range_match:
+            layer_indices: list[int] = []
+            for target in range_match.group("targets").split(","):
+                if "-" in target:
+                    first_layer, last_layer = target.split("-", 1)
+                    layer_indices.extend(range(int(first_layer), int(last_layer) + 1))
                 else:
-                    idxs.append(int(part))
-            for i in idxs:
-                if not 0 <= i < n_layers:
-                    raise ArchError(f"索引 {i} 越界（n_layers={n_layers}）: {stmt!r}")
-            over = _parse_assign(m.group("assign"))
-            for i in idxs:
-                prev = layers[i] if layers[i] is not None else base
-                layers[i] = _merge(prev, over)
-            continue
-        m = _ASSIGN_RE.match(stmt)
-        if not m:
-            raise ArchError(f"pattern 语句无法解析: {stmt!r}")
-        rep = int(m.group("rep")) if m.group("rep") else 1
-        over = _parse_assign(m.group("assign"))
-        for _ in range(rep):
-            if pos >= n_layers:
-                raise ArchError(f"pattern 展开超过 n_layers={n_layers}: {stmt!r}")
-            layers[pos] = _merge(base, over)
-            pos += 1
-    if pos != n_layers and any(layer is None for layer in layers):
-        raise ArchError(f"pattern 只覆盖 {pos}/{n_layers} 层")
-    return [layer for layer in layers if layer is not None]
-
-
-# ---------------------------------------------------------------------------
-# → OLMo 翻译与构建
-# ---------------------------------------------------------------------------
-
-
-def _dtype(name: str) -> DType:
-    try:
-        return getattr(DType, name)
-    except AttributeError:
-        raise ArchError(f"未知 dtype: {name!r}，可选: float32/bfloat16")
-
-
-def _init(name: str) -> InitMethod:
-    try:
-        return getattr(InitMethod, name)
-    except AttributeError:
-        raise ArchError(
-            f"未知 init_method: {name!r}，可选: normal/llama/llama_depth/normalized/fan_in"
-        )
-
-
-def _cfg(group: str, name: str, kwargs: Dict[str, Any]):
-    cls = get_config(group, name)
-    try:
-        return cls(**kwargs)
-    except TypeError as e:
-        raise ArchError(f"{group}.{name} 配置构造失败（未知字段？）: {e}") from e
-
-
-def _inject(kwargs: Dict[str, Any], group: str, name: str, key: str, value: Any) -> Dict[str, Any]:
-    """把 spec 级默认值（dtype/rope_theta/window）注入变体 config——**仅当变体有该字段**。
-
-    OLMo 各模块 config 的 dtype 默认 float32，不注入会与 embedding/lm_head 混型；
-    rope_theta/window 同理只对声明了该字段的变体（如 full）注入。
-    """
-    if key in kwargs:
-        return kwargs
-    fields = getattr(get_config(group, name), "__dataclass_fields__", {})
-    if key in fields:
-        kwargs[key] = value
-    return kwargs
+                    layer_indices.append(int(target))
+            for layer_index in layer_indices:
+                if not 0 <= layer_index < n_layers:
+                    raise ArchError(f"layer index {layer_index} exceeds n_layers={n_layers}")
+                else:
+                    previous_layer = layers[layer_index]
+                    layers[layer_index] = assign_layer(
+                        previous_layer if previous_layer is not None else base_layer,
+                        range_match.group("assign"),
+                    )
+        else:
+            assignment_match = ASSIGNMENT_PATTERN.match(statement)
+            if assignment_match is None:
+                raise ArchError(f"invalid architecture pattern statement: {statement!r}")
+            else:
+                repetitions = int(assignment_match.group("rep") or "1")
+                for _ in range(repetitions):
+                    if next_layer_index >= n_layers:
+                        raise ArchError(f"pattern exceeds n_layers={n_layers}: {statement!r}")
+                    else:
+                        layers[next_layer_index] = assign_layer(
+                            base_layer, assignment_match.group("assign")
+                        )
+                        next_layer_index += 1
+    if next_layer_index != n_layers and any(layer is None for layer in layers):
+        raise ArchError(f"pattern covers only {next_layer_index}/{n_layers} layers")
+    else:
+        return [layer for layer in layers if layer is not None]
 
 
 def spec_to_olmo(spec: ArchSpec) -> TransformerConfig:
-    block_by_key: Dict[str, str] = {}
-    block_cfgs: List[TransformerBlockConfig] = []
-    pattern: List[str] = []
-    for i, layer in enumerate(spec.layers):
+    block_names_by_layer: dict[str, str] = {}
+    block_configs: dict[str, TransformerBlockConfig] = {}
+    block_pattern: list[str] = []
+    for layer in spec.layers:
         if layer.placement != "pre":
-            raise ArchError(
-                f"placement={layer.placement!r} 尚未映射到 OLMo block 类型（v1 仅支持 pre）；"
-                "自定义 placement 需写 TransformerConfig 子类 + 自定义 block，见 attn/GUIDE.md"
-            )
-        key = json.dumps(dataclasses.asdict(layer), sort_keys=True)
-        if key not in block_by_key:
-            attn_kwargs = _inject(
-                dict(layer.attn_kwargs), "attn", layer.attn, "rope_theta", spec.rope_theta
-            )
-            if layer.window is not None and "window" in getattr(
-                get_config("attn", layer.attn), "__dataclass_fields__", {}
-            ):
-                attn_kwargs.setdefault("window", layer.window)
-            attn_cfg = _cfg(
-                "attn", layer.attn, _inject(attn_kwargs, "attn", layer.attn, "dtype", spec.dtype)
-            )
-            ffn_cfg = _cfg(
-                "ffn",
-                layer.ffn,
-                _inject(dict(layer.ffn_kwargs), "ffn", layer.ffn, "dtype", spec.dtype),
-            )
-            norm_cfg = _cfg(
-                "norm",
-                layer.norm,
-                _inject(dict(layer.norm_kwargs), "norm", layer.norm, "dtype", spec.dtype),
-            )
-            name = f"b{len(block_cfgs)}"
-            is_moe = bool(getattr(ffn_cfg, "is_moe", False))
-            if is_moe and layer.res_alpha != 1.0:
-                raise ArchError(
-                    f"layers[{i}]: MoE block 不支持残差缩放（OLMo MoETransformerBlock 无 alpha 参数），"
-                    "res_alpha 需为 1.0"
+            raise ArchError(f"unsupported OLMo block placement: {layer.placement!r}")
+        else:
+            pass
+        layer_identity = json.dumps(dataclasses.asdict(layer), sort_keys=True)
+        if layer_identity in block_names_by_layer:
+            block_pattern.append(block_names_by_layer[layer_identity])
+        else:
+            attention_options = dict(layer.attn_kwargs)
+            attention_options.setdefault("dtype", spec.dtype)
+            if layer.attn == "full":
+                attention_options.setdefault("rope_theta", spec.rope_theta)
+                if layer.window is not None:
+                    attention_options.setdefault("window", layer.window)
+                else:
+                    pass
+                try:
+                    attention_config = FullAttentionConfig(**attention_options)
+                except TypeError as error:
+                    raise ArchError(f"full attention configuration failed: {error}") from error
+            elif layer.attn == "qwen35_gdn":
+                try:
+                    attention_config = Qwen35GDNConfig(**attention_options)
+                except TypeError as error:
+                    raise ArchError(f"GDN configuration failed: {error}") from error
+            else:
+                raise ArchError(f"unsupported attention: {layer.attn!r}")
+            if layer.ffn != "swiglu" or layer.norm != "rms":
+                raise ArchError(f"unsupported feed-forward or norm: {layer.ffn!r}, {layer.norm!r}")
+            else:
+                feed_forward_options = dict(layer.ffn_kwargs)
+                feed_forward_options.setdefault("dtype", spec.dtype)
+                norm_options = dict(layer.norm_kwargs)
+                norm_options.setdefault("dtype", spec.dtype)
+                block_name = f"b{len(block_configs)}"
+                try:
+                    layer_norm = RmsNormConfig(**norm_options)
+                    feed_forward = SwigluConfig(**feed_forward_options)
+                except TypeError as error:
+                    raise ArchError(
+                        f"norm or feed-forward configuration failed: {error}"
+                    ) from error
+                block_configs[block_name] = TransformerBlockConfig(
+                    sequence_mixer=attention_config,
+                    layer_norm=layer_norm,
+                    feed_forward=feed_forward,
+                    attention_residual_alpha=layer.res_alpha,
+                    feed_forward_residual_alpha=layer.res_alpha,
                 )
-            block_cfgs.append(
-                TransformerBlockConfig(
-                    sequence_mixer=attn_cfg,
-                    layer_norm=norm_cfg,
-                    feed_forward=None if is_moe else ffn_cfg,
-                    feed_forward_moe=ffn_cfg if is_moe else None,
-                    name=TransformerBlockType.moe if is_moe else TransformerBlockType.default,
-                    **(
-                        {}
-                        if is_moe
-                        else dict(
-                            attention_residual_alpha=layer.res_alpha,
-                            feed_forward_residual_alpha=layer.res_alpha,
-                        )
-                    ),
-                )
-            )
-            block_by_key[key] = name
-        pattern.append(block_by_key[key])
-
-    final_norm = _cfg("norm", spec.final_norm, dict(spec.final_norm_kwargs))
+                block_names_by_layer[layer_identity] = block_name
+                block_pattern.append(block_name)
+    if spec.final_norm != "rms":
+        raise ArchError(f"unsupported final norm: {spec.final_norm!r}")
+    else:
+        try:
+            final_norm = RmsNormConfig(**spec.final_norm_kwargs)
+        except TypeError as error:
+            raise ArchError(f"final norm configuration failed: {error}") from error
     return TransformerConfig(
         d_model=spec.d_model,
         vocab_size=spec.vocab_size,
         n_layers=spec.n_layers,
-        block={
-            name: cfg for name, cfg in zip((f"b{i}" for i in range(len(block_cfgs))), block_cfgs)
-        },
-        block_pattern=pattern,
-        lm_head=LMHeadConfig(
-            layer_norm=final_norm,
-            bias=False,
-        ),
-        dtype=_dtype(spec.dtype),
-        init_method=_init(spec.init_method),
+        block=block_configs,
+        block_pattern=block_pattern,
+        lm_head=LMHeadConfig(layer_norm=final_norm, bias=False),
+        dtype=DType(spec.dtype),
+        init_method=InitMethod(spec.init_method),
         init_std=spec.init_std,
         tie_word_embeddings=spec.tie_word_embeddings,
     )
 
 
-def build_model(spec: ArchSpec, *, init_device: str = "cpu", checkpoint_blocks: bool = False):
-    """构建真实模型（init_device="meta" 用于仅算 FLOPs）。"""
+def build_model(
+    spec: ArchSpec, *, init_device: str = "cpu", checkpoint_blocks: bool = False
+) -> Transformer:
     model = spec_to_olmo(spec).build(init_device=init_device)
     if checkpoint_blocks:
         model.apply_activation_checkpointing("full")
+    else:
+        pass
     return model
 
 
 def spec_num_params(spec: ArchSpec) -> int:
-    tc = spec_to_olmo(spec)
-    n = tc.num_params
-    return n() if callable(n) else n
+    return spec_to_olmo(spec).num_params

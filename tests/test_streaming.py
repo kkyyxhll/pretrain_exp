@@ -1,35 +1,62 @@
 """Compressed stream adapter: exact next batches, masks and RNG isolation."""
 
+from __future__ import annotations
+
 import json
 import os
+from collections.abc import Sequence
+from pathlib import Path
+from typing import ClassVar, Literal
 
 import numpy as np
 import pytest
 import torch
+from numpy.typing import NDArray
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
-from data.corpus import CorpusError, CorpusReader
-from data.olmo_streaming import (
+from src.data.corpus import CorpusError, CorpusReader
+from src.data.olmo_streaming import (
     OFFICIAL_TRAIN_SHARDS,
     HFStreamingTokenizer,
+    StreamingLoaderState,
     StreamingOLMoLoader,
     build_official_streaming_loader,
     official_compressed_input_identity,
 )
-from data.pack import PackedDataLoader
+from src.data.pack import PackedDataLoader
+
+zstandard = pytest.importorskip("zstandard")
+
+type CheckpointValue = (
+    bool
+    | int
+    | str
+    | None
+    | NDArray[np.int32 | np.bool_]
+    | dict[str, CheckpointValue]
+    | list[CheckpointValue]
+    | tuple[CheckpointValue, ...]
+)
 
 
 class ByteTokenizer:
-    bos_id, eos_id, pad_id = 258, 256, 257
-    byte_lengths = np.array([1] * 256 + [0, 0, 0])
+    bos_id: ClassVar[int] = 258
+    eos_id: ClassVar[int] = 256
+    pad_id: ClassVar[int] = 257
+    byte_lengths: ClassVar[NDArray[np.int64]] = np.array([1] * 256 + [0, 0, 0])
 
-    def encode_batch(self, texts, threads=None):
+    def encode_batch(self, texts: Sequence[str], threads: int | None = None) -> list[list[int]]:
+        # note (kkyyxhll): The tokenizer interface accepts thread limits; byte encoding is serial.
         return [list(text.encode("utf-8")) for text in texts]
 
 
-def make_loader(path, work_dir, identity=None):
+def make_loader(
+    corpus_path: Path, work_dir: Path, input_identity: dict[str, str] | None = None
+) -> StreamingOLMoLoader:
     packed = PackedDataLoader(
         ByteTokenizer(),
-        [path],
+        [corpus_path],
         batch_size=2,
         sequence_length=16,
         doc_batch=4,
@@ -38,41 +65,41 @@ def make_loader(path, work_dir, identity=None):
         mask_separator=True,
     )
     return StreamingOLMoLoader(
-        packed, work_dir=work_dir, input_identity=identity or {"fixture": "compressed-v1"}
+        packed,
+        work_dir=work_dir,
+        input_identity=input_identity or {"fixture": "compressed-v1"},
     )
 
 
-def test_compressed_resume_next_batches_and_global_rng(tmp_path):
-    zstd = pytest.importorskip("zstandard")
+def test_compressed_resume_next_batches_and_global_rng(tmp_path: Path) -> None:
     path = tmp_path / "train.jsonl.zst"
     raw = b"\n".join(
-        json.dumps({"text": "你好 doc " + str(i) + " abcdef"}, ensure_ascii=False).encode()
-        for i in range(30)
+        json.dumps({"text": f"你好 doc {i} abcdef"}, ensure_ascii=False).encode() for i in range(30)
     )
-    path.write_bytes(zstd.ZstdCompressor().compress(raw))
+    path.write_bytes(zstandard.ZstdCompressor().compress(raw))
     loader = make_loader(path, tmp_path / "first")
     loader.reshuffle(1)
-    rng = torch.get_rng_state().clone()
-    it = iter(loader)
-    next(it)
-    next(it)
+    random_state = torch.get_rng_state().clone()
+    batches = iter(loader)
+    next(batches)
+    next(batches)
     state = loader.state_dict()
-    expected = [next(it) for _ in range(3)]
+    expected_batches = [next(batches) for _ in range(3)]
     restored = make_loader(path, tmp_path / "restored")
     restored.load_state_dict(state)
     restored.reshuffle(1)
-    ri = iter(restored)
-    for want in expected:
-        got = next(ri)
-        assert torch.equal(got["input_ids"], want["input_ids"])
-        assert torch.equal(got["labels"], want["labels"])
-        assert not torch.any(got["labels"] == 256)  # EOS loss stays masked
-    assert torch.equal(rng, torch.get_rng_state())
+    restored_batches = iter(restored)
+    for expected_batch in expected_batches:
+        restored_batch = next(restored_batches)
+        assert torch.equal(restored_batch["input_ids"], expected_batch["input_ids"])
+        assert torch.equal(restored_batch["labels"], expected_batch["labels"])
+        assert not torch.any(restored_batch["labels"] == ByteTokenizer.eos_id)
+    assert torch.equal(random_state, torch.get_rng_state())
     assert restored.batches_processed == loader.batches_processed
     assert not path.with_suffix("").exists()
 
 
-def test_identity_change_rejected(tmp_path):
+def test_identity_change_rejected(tmp_path: Path) -> None:
     path = tmp_path / "train.jsonl"
     path.write_text('{"text":"abcd"}\n')
     loader = make_loader(path, tmp_path / "one")
@@ -82,34 +109,34 @@ def test_identity_change_rejected(tmp_path):
         other.load_state_dict(loader.state_dict())
 
 
-def assert_state_equal(a, b):
-    if isinstance(a, np.ndarray):
-        assert np.array_equal(a, b)
-    elif isinstance(a, dict):
-        assert a.keys() == b.keys()
-        for key in a:
-            assert_state_equal(a[key], b[key])
-    elif isinstance(a, (list, tuple)):
-        assert len(a) == len(b)
-        for x, y in zip(a, b):
-            assert_state_equal(x, y)
+def assert_state_equal(expected_state: CheckpointValue, actual_state: CheckpointValue) -> None:
+    if isinstance(expected_state, np.ndarray):
+        assert isinstance(actual_state, np.ndarray)
+        assert np.array_equal(expected_state, actual_state)
+    elif isinstance(expected_state, dict):
+        assert isinstance(actual_state, dict)
+        assert expected_state.keys() == actual_state.keys()
+        for state_field in expected_state:
+            assert_state_equal(expected_state[state_field], actual_state[state_field])
+    elif isinstance(expected_state, (list, tuple)):
+        assert isinstance(actual_state, (list, tuple))
+        assert len(expected_state) == len(actual_state)
+        for expected_value, actual_value in zip(expected_state, actual_state):
+            assert_state_equal(expected_value, actual_value)
     else:
-        assert a == b
+        assert expected_state == actual_state
 
 
-def write_compressed(path, texts):
-    zstd = pytest.importorskip("zstandard")
-    path.write_bytes(
-        zstd.ZstdCompressor().compress(
-            b"\n".join(json.dumps({"text": t}, ensure_ascii=True).encode() for t in texts)
+def write_compressed(corpus_path: Path, texts: list[str]) -> Path:
+    corpus_path.write_bytes(
+        zstandard.ZstdCompressor().compress(
+            b"\n".join(json.dumps({"text": text}, ensure_ascii=True).encode() for text in texts)
         )
     )
-    return path
+    return corpus_path
 
 
-def test_all_state_resume_across_corpus_passes_and_iterator_reentry(tmp_path):
-    # A prefetch spans several complete corpus passes; no documents are lost
-    # and counters must not grow just because the prefetch buffer is restored.
+def test_all_state_resume_across_corpus_passes_and_iterator_reentry(tmp_path: Path) -> None:
     path = write_compressed(tmp_path / "train.jsonl.zst", ["ab", "", "中文"])
     continuous = make_loader(path, tmp_path / "continuous")
     continuous.reshuffle(1)
@@ -119,7 +146,6 @@ def test_all_state_resume_across_corpus_passes_and_iterator_reentry(tmp_path):
     restored = make_loader(path, tmp_path / "restored")
     restored.load_state_dict(checkpoint)
     assert_state_equal(checkpoint, restored.state_dict())
-    # A second serialization immediately after load must preserve everything.
     restored_twice = make_loader(path, tmp_path / "restored-twice")
     restored_twice.load_state_dict(restored.state_dict())
     for _ in range(9):
@@ -132,7 +158,7 @@ def test_all_state_resume_across_corpus_passes_and_iterator_reentry(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "packing_field,packing_value",
     [
         ("loop", False),
         ("doc_batch", 2),
@@ -142,10 +168,16 @@ def test_all_state_resume_across_corpus_passes_and_iterator_reentry(tmp_path):
         ("batch_size", 1),
     ],
 )
-def test_actual_packing_change_rejected_even_with_same_user_identity(tmp_path, field, value):
+def test_actual_packing_change_rejected_even_with_same_user_identity(
+    tmp_path: Path,
+    packing_field: Literal[
+        "loop", "doc_batch", "drop_last", "mask_separator", "sequence_length", "batch_size"
+    ],
+    packing_value: int | bool,
+) -> None:
     path = write_compressed(tmp_path / "train.jsonl.zst", ["abcd"])
     original = make_loader(path, tmp_path / "one")
-    kwargs = dict(
+    packing_options = dict(
         batch_size=2,
         sequence_length=16,
         doc_batch=4,
@@ -153,8 +185,8 @@ def test_actual_packing_change_rejected_even_with_same_user_identity(tmp_path, f
         on_bad_utf8="raise",
         mask_separator=True,
     )
-    kwargs[field] = value
-    packed = PackedDataLoader(ByteTokenizer(), [path], **kwargs)
+    packing_options[packing_field] = packing_value
+    packed = PackedDataLoader(ByteTokenizer(), [path], **packing_options)
     changed = StreamingOLMoLoader(
         packed, work_dir=tmp_path / "two", input_identity={"fixture": "compressed-v1"}
     )
@@ -162,28 +194,28 @@ def test_actual_packing_change_rejected_even_with_same_user_identity(tmp_path, f
         changed.load_state_dict(original.state_dict())
 
 
-def make_hf_tokenizer(directory):
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
-
-    vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
-    vocab.update({"<eos>": 256, "<pad>": 257})
-    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+def make_hf_tokenizer(tokenizer_dir: Path) -> PreTrainedTokenizerFast:
+    vocabulary = {
+        character: token_id
+        for token_id, character in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))
+    }
+    vocabulary.update({"<eos>": 256, "<pad>": 257})
+    backend = Tokenizer(models.BPE(vocab=vocabulary, merges=[]))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     backend.decoder = decoders.ByteLevel()
-    hf = PreTrainedTokenizerFast(
+    tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=backend, eos_token="<eos>", pad_token="<pad>", model_max_length=100000
     )
-    hf.save_pretrained(directory)
-    return hf
+    tokenizer.save_pretrained(tokenizer_dir)
+    return tokenizer
 
 
-def test_hf_original_text_and_literal_eos_labels(tmp_path):
-    hf = make_hf_tokenizer(tmp_path / "tokenizer")
-    adapter = HFStreamingTokenizer(hf)
+def test_hf_original_text_and_literal_eos_labels(tmp_path: Path) -> None:
+    tokenizer = make_hf_tokenizer(tmp_path / "tokenizer")
+    adapter = HFStreamingTokenizer(tokenizer)
     texts = ["prefix <eos> suffix", "汉字🙂\n\t", ""]
     encoded = adapter.encode_batch(texts)
-    assert encoded == hf(texts, add_special_tokens=False)["input_ids"]
+    assert encoded == tokenizer(texts, add_special_tokens=False)["input_ids"]
     literal_eos = encoded[0].index(adapter.eos_id)
     assert literal_eos > 0
     path = write_compressed(tmp_path / "train.jsonl.zst", texts)
@@ -195,48 +227,50 @@ def test_hf_original_text_and_literal_eos_labels(tmp_path):
     assert batch.labels[0, len(encoded[0]) - 1] == -100
 
 
-def test_official_all_eight_hashes_and_source_identity(tmp_path):
-    data = tmp_path / "data"
-    data.mkdir()
+def test_official_all_eight_hashes_and_source_identity(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
     for i, name in enumerate(OFFICIAL_TRAIN_SHARDS):
-        write_compressed(data / name, [str(i) + " xyz"])
+        write_compressed(data_dir / name, [f"{i} xyz"])
     make_hf_tokenizer(tmp_path / "tokenizer")
-    args = dict(
+    loader_options = dict(
         batch_size=2,
         sequence_length=17,
         work_dir=tmp_path / "work",
         doc_batch=5,
         model_vocab_size=258,
     )
-    loader = build_official_streaming_loader(data, tmp_path / "tokenizer", **args)
-    assert [r["name"] for r in loader.input_manifest] == list(OFFICIAL_TRAIN_SHARDS)
-    assert all(len(r["sha256"]) == 64 for r in loader.input_manifest)
+    loader = build_official_streaming_loader(data_dir, tmp_path / "tokenizer", **loader_options)
+    assert [shard_identity["name"] for shard_identity in loader.input_manifest] == list(
+        OFFICIAL_TRAIN_SHARDS
+    )
+    assert all(len(shard_identity["sha256"]) == 64 for shard_identity in loader.input_manifest)
     assert loader.packed.loop and loader.packed.reader.on_blank == "raise"
-    assert all(p.suffix == ".zst" for p in loader.packed.reader.paths)
-    assert not list(data.glob("*.jsonl"))
+    assert all(path.suffix == ".zst" for path in loader.packed.reader.paths)
+    assert not list(data_dir.glob("*.jsonl"))
     loader.reshuffle(1)
-    it = iter(loader)
-    next(it)
+    batches = iter(loader)
+    next(batches)
     saved = loader.state_dict()
-    wanted = [next(it) for _ in range(5)]
-    restored = build_official_streaming_loader(data, tmp_path / "tokenizer", **args)
+    expected_batches = [next(batches) for _ in range(5)]
+    restored = build_official_streaming_loader(data_dir, tmp_path / "tokenizer", **loader_options)
     restored.load_state_dict(saved)
-    for batch in wanted:
-        got = next(iter(restored))
-        assert torch.equal(batch["input_ids"], got["input_ids"])
-        assert torch.equal(batch["labels"], got["labels"])
+    for expected_batch in expected_batches:
+        restored_batch = next(iter(restored))
+        assert torch.equal(expected_batch["input_ids"], restored_batch["input_ids"])
+        assert torch.equal(expected_batch["labels"], restored_batch["labels"])
     assert_state_equal(restored.state_dict(), loader.state_dict())
-    write_compressed(data / OFFICIAL_TRAIN_SHARDS[-1], ["different"])
-    changed = build_official_streaming_loader(data, tmp_path / "tokenizer", **args)
+    write_compressed(data_dir / OFFICIAL_TRAIN_SHARDS[-1], ["different"])
+    changed = build_official_streaming_loader(data_dir, tmp_path / "tokenizer", **loader_options)
     with pytest.raises(ValueError, match="identity changed"):
         changed.load_state_dict(saved)
-    (data / OFFICIAL_TRAIN_SHARDS[-1]).unlink()
+    (data_dir / OFFICIAL_TRAIN_SHARDS[-1]).unlink()
     with pytest.raises(ValueError, match="eight official"):
-        official_compressed_input_identity(data)
+        official_compressed_input_identity(data_dir)
 
 
 @pytest.mark.parametrize("raw", [b"\n", b'{"text":"\\ud800"}\n', b'{"id":1}\n'])
-def test_strict_no_filter_errors(tmp_path, raw):
+def test_strict_no_filter_errors(tmp_path: Path, raw: bytes) -> None:
     path = tmp_path / "train.jsonl"
     path.write_bytes(raw)
     packed = PackedDataLoader(
@@ -252,7 +286,7 @@ def test_strict_no_filter_errors(tmp_path, raw):
         next(packed.batches())
 
 
-def test_empty_loop_fails_instead_of_hanging(tmp_path):
+def test_empty_loop_fails_instead_of_hanging(tmp_path: Path) -> None:
     path = tmp_path / "train.jsonl"
     path.write_bytes(b"")
     packed = PackedDataLoader(
@@ -268,17 +302,17 @@ def test_empty_loop_fails_instead_of_hanging(tmp_path):
         next(packed.batches())
 
 
-def test_dp2_document_union_and_complete_resume(tmp_path):
-    paths = []
-    expected_documents = {}
+def test_dp2_document_union_and_complete_resume(tmp_path: Path) -> None:
+    paths: list[Path] = []
+    expected_documents: dict[tuple[str, int], str] = {}
     for shard_index, name in enumerate(OFFICIAL_TRAIN_SHARDS):
         texts = [f"shard{shard_index} document{line} 中文" for line in range(16)]
         paths.append(write_compressed(tmp_path / name, texts))
         expected_documents.update({(name, line): text for line, text in enumerate(texts)})
-    observed = {}
-    saved_states = []
+    observed_documents: dict[tuple[str, int], str] = {}
+    saved_states: list[StreamingLoaderState] = []
 
-    def ranked(rank, world_size=2):
+    def ranked(rank: int, world_size: int = 2) -> StreamingOLMoLoader:
         packed = PackedDataLoader(
             ByteTokenizer(),
             paths,
@@ -304,10 +338,10 @@ def test_dp2_document_union_and_complete_resume(tmp_path):
             paths, rank=rank, world_size=2, loop=False, on_bad_utf8="raise", on_blank="raise"
         )
         for document in reader.documents():
-            key = (document.shard, document.index)
-            assert key not in observed  # No document duplicated across ranks.
+            document_location = (document.shard, document.index)
+            assert document_location not in observed_documents
             assert document.index % 2 == rank
-            observed[key] = document.text
+            observed_documents[document_location] = document.text
         loader = ranked(rank)
         loader.reshuffle(1)
         iterator = iter(loader)
@@ -322,28 +356,28 @@ def test_dp2_document_union_and_complete_resume(tmp_path):
         restored = ranked(rank)
         restored.load_state_dict(checkpoint)
         assert_state_equal(checkpoint, restored.state_dict())
-        for _ in range(100):  # Includes traversal into the next complete pass.
+        for _ in range(100):
             expected = next(iterator)
             actual = next(iter(restored))
             assert torch.equal(expected["input_ids"], actual["input_ids"])
             assert torch.equal(expected["labels"], actual["labels"])
         assert_state_equal(loader.state_dict(), restored.state_dict())
         assert loader.packed.reader.state()["epoch"] >= 1
-    assert observed == expected_documents
+    assert observed_documents == expected_documents
     with pytest.raises(ValueError, match="rank and world_size"):
         ranked(1).load_state_dict(saved_states[0])
     with pytest.raises(ValueError, match="rank and world_size"):
         ranked(0, 4).load_state_dict(saved_states[0])
 
 
-def test_official_builder_explicit_dp_rank(tmp_path):
-    data = tmp_path / "data"
-    data.mkdir()
+def test_official_builder_explicit_dp_rank(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
     for name in OFFICIAL_TRAIN_SHARDS:
-        write_compressed(data / name, [f"line {i} 中" for i in range(16)])
+        write_compressed(data_dir / name, [f"line {i} 中" for i in range(16)])
     make_hf_tokenizer(tmp_path / "tokenizer")
     loader = build_official_streaming_loader(
-        data,
+        data_dir,
         tmp_path / "tokenizer",
         batch_size=2,
         sequence_length=8,
@@ -361,56 +395,77 @@ def test_official_builder_explicit_dp_rank(tmp_path):
         )
 
 
-# Opt-in, offline integration: set a JSON object mapping model names to
-# existing local tokenizer directories. No test downloads data or weights.
-_REAL_TOKENIZERS = json.loads(os.environ.get("PRETRAIN_TEST_HF_TOKENIZER_DIRS", "{}"))
+# note (kkyyxhll): Optional integration uses local tokenizers and never downloads model assets.
+TOKENIZER_DIRECTORY_VALUE: object = json.loads(
+    os.environ.get("PRETRAIN_TEST_HF_TOKENIZER_DIRS", "{}")
+)
+if not isinstance(TOKENIZER_DIRECTORY_VALUE, dict):
+    raise ValueError(
+        "PRETRAIN_TEST_HF_TOKENIZER_DIRS must map tokenizer names to local directories"
+    )
+else:
+    REAL_TOKENIZERS: dict[str, str] = {}
+    for tokenizer_name, tokenizer_dir in TOKENIZER_DIRECTORY_VALUE.items():
+        if isinstance(tokenizer_name, str) and isinstance(tokenizer_dir, str):
+            REAL_TOKENIZERS[tokenizer_name] = tokenizer_dir
+        else:
+            raise ValueError(
+                "PRETRAIN_TEST_HF_TOKENIZER_DIRS names and directories must be strings"
+            )
 
 
-@pytest.mark.parametrize("name,directory", list(_REAL_TOKENIZERS.items()) or [(None, None)])
-def test_real_local_hf_packing_and_complete_restore(tmp_path, name, directory):
-    if directory is None:
+@pytest.mark.parametrize(
+    "tokenizer_name,tokenizer_dir", list(REAL_TOKENIZERS.items()) or [(None, None)]
+)
+def test_real_local_hf_packing_and_complete_restore(
+    tmp_path: Path, tokenizer_name: str | None, tokenizer_dir: str | None
+) -> None:
+    if tokenizer_dir is None:
         pytest.skip("set PRETRAIN_TEST_HF_TOKENIZER_DIRS to existing local tokenizer directories")
-    adapter = HFStreamingTokenizer.from_local(directory)
+    else:
+        pass
+    adapter = HFStreamingTokenizer.from_local(tokenizer_dir)
     literal = adapter.hf.eos_token
     texts = ["", "hello 中文🙂\n", f"prefix {literal} suffix", "long 汉字 " * 12000]
-    ids = adapter.hf(texts, add_special_tokens=False, truncation=False, padding=False)["input_ids"]
-    assert adapter.encode_batch(texts) == ids
-    assert len(ids[-1]) > 8192
-    assert adapter.eos_id in ids[2]
-    # Independent flatten/shift reference: literal EOS inside the text stays
-    # trainable; the separator appended after each document is masked.
-    flat, mask = [], []
-    for doc in ids:
-        flat.extend(doc + [adapter.eos_id])
-        mask.extend([True] * len(doc) + [False])
-    data = tmp_path / "data"
-    data.mkdir()
+    token_ids = adapter.hf(texts, add_special_tokens=False, truncation=False, padding=False)[
+        "input_ids"
+    ]
+    assert adapter.encode_batch(texts) == token_ids
+    assert len(token_ids[-1]) > 8192
+    assert adapter.eos_id in token_ids[2]
+    concatenated_tokens: list[int] = []
+    text_mask: list[bool] = []
+    for document_tokens in token_ids:
+        concatenated_tokens.extend(document_tokens + [adapter.eos_id])
+        text_mask.extend([True] * len(document_tokens) + [False])
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
     for shard in OFFICIAL_TRAIN_SHARDS:
-        write_compressed(data / shard, texts)
-    kwargs = dict(batch_size=2, sequence_length=64, doc_batch=2, work_dir=tmp_path / "work")
-    loader = build_official_streaming_loader(data, directory, **kwargs)
+        write_compressed(data_dir / shard, texts)
+    loader_options = dict(batch_size=2, sequence_length=64, doc_batch=2, work_dir=tmp_path / "work")
+    loader = build_official_streaming_loader(data_dir, tokenizer_dir, **loader_options)
     loader.reshuffle(1)
     iterator = iter(loader)
     first = next(iterator)
-    ref_inputs = torch.tensor([flat[:64], flat[64:128]])
-    ref_labels = torch.tensor(
+    reference_inputs = torch.tensor([concatenated_tokens[:64], concatenated_tokens[64:128]])
+    reference_labels = torch.tensor(
         [
-            [flat[i] if mask[i] else -100 for i in range(1, 65)],
-            [flat[i] if mask[i] else -100 for i in range(65, 129)],
+            [concatenated_tokens[i] if text_mask[i] else -100 for i in range(1, 65)],
+            [concatenated_tokens[i] if text_mask[i] else -100 for i in range(65, 129)],
         ]
     )
-    assert torch.equal(first["input_ids"], ref_inputs), name
-    assert torch.equal(first["labels"], ref_labels), name
+    assert torch.equal(first["input_ids"], reference_inputs), tokenizer_name
+    assert torch.equal(first["labels"], reference_labels), tokenizer_name
     for _ in range(2):
         next(iterator)
     saved = loader.state_dict()
     expected = [next(iterator) for _ in range(5)]
-    restored = build_official_streaming_loader(data, directory, **kwargs)
+    restored = build_official_streaming_loader(data_dir, tokenizer_dir, **loader_options)
     restored.load_state_dict(saved)
     assert_state_equal(saved, restored.state_dict())
-    for want in expected:
-        got = next(iter(restored))
-        assert torch.equal(want["input_ids"], got["input_ids"]), name
-        assert torch.equal(want["labels"], got["labels"]), name
+    for expected_batch in expected:
+        restored_batch = next(iter(restored))
+        assert torch.equal(expected_batch["input_ids"], restored_batch["input_ids"]), tokenizer_name
+        assert torch.equal(expected_batch["labels"], restored_batch["labels"]), tokenizer_name
     assert_state_equal(loader.state_dict(), restored.state_dict())
-    assert not list(data.glob("*.jsonl"))
+    assert not list(data_dir.glob("*.jsonl"))

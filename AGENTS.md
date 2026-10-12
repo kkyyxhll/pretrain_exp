@@ -5,6 +5,7 @@
 - 使用已有 `conda activate olmo`。共享环境升级需由维护者协调。
 - 使用自己的 branch 和 worktree，`git config --worktree` 配置身份。每个功能单独提交，通过 PR 合并 main；首次提交由维护者完成。
 - pre-commit 与 Ruff 检查自有代码。每个 worktree 用 `core.hooksPath --worktree` 指向个人 hook 目录；不覆盖共享 Git common hooks。初始仓库先暂存文件再检查，不能把空索引检查当作全仓通过。
+- 自有代码遵循 [coding style](https://github.com/sgl-project/sglang-omni/blob/main/.claude/skills/code-review/coding-style.md)：优先简单实现与完整单位命名，模块级导入、具体类型注解、短注释和清晰分支；配置与 checkpoint 外部键保持兼容，不引入单次调用抽象或通用框架。Ruff 检查注解与现代类型语法；第三方及官方原件不适用本次重构。
 - 只使用 8 个官方压缩训练分片，流式读取，不清洗、过滤、去重、解压或拟合 tokenizer。现成 tokenizer 固定版本；训练随机初始化。
 - 单机 DP2：global batch128，length8192，默认 microbatch16，梯度累积4；seed20261011。模型/optimizer/梯度保留 FP32，计算 BF16，FlashAttention2+FLA，完整激活重计算与1024-token分块CE。
 - Qwen3.5 配方集中在 `recipes/qwen35-08b/`：`train.py`、`train_qwen35_dp2.sh`、`model.py`、`config.json`。固定下载的 tokenizer 放在其 `tokenizer-qwen35/`，忽略 Git；流式读取所需辅助归 `src/data/`。

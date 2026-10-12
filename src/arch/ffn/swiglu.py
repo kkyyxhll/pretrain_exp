@@ -3,25 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from olmo_core.config import DType
 from olmo_core.nn.config import ModuleConfig
-from olmo_core.nn.feed_forward import ActivationFunction, FeedForwardConfig
+from olmo_core.nn.feed_forward import ActivationFunction, FeedForward, FeedForwardConfig
 
-from ..core.registry import register
-
-__all__ = ["SwigluConfig"]
+__all__: list[str] = ["SwigluConfig"]
 
 
-@register("ffn", "swiglu")
-@dataclass
+@dataclass(kw_only=True)
 class SwigluConfig(ModuleConfig):
-    """可搜索超参：hidden_mult（相对 d_model 的隐藏维倍数）、activation、bias。"""
+    """SwiGLU projection width and activation configuration."""
 
-    hidden_mult: float = 4.0  # 允许非整数倍（Qwen3.5 = 3.5）
+    hidden_mult: float = 4.0
     activation: ActivationFunction = ActivationFunction.silu
     bias: bool = False
-    dtype: str = "float32"
+    dtype: Literal["float32", "bfloat16", "float16"] = "float32"
 
     def to_olmo(self, d_model: int) -> FeedForwardConfig:
         return FeedForwardConfig(
@@ -34,5 +32,5 @@ class SwigluConfig(ModuleConfig):
     def num_params(self, d_model: int) -> int:
         return self.to_olmo(d_model).num_params(d_model)
 
-    def build(self, d_model: int, *, init_device: str = "cpu"):
+    def build(self, d_model: int, *, init_device: str = "cpu") -> FeedForward:
         return self.to_olmo(d_model).build(d_model, init_device=init_device)
