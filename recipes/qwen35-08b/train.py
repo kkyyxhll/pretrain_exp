@@ -24,6 +24,7 @@ import torch
 import torch.distributed as distributed
 from olmo_core.config import DType
 from olmo_core.distributed.utils import init_distributed
+from olmo_core.optim import OptimGroupOverride
 from olmo_core.optim.adamw import AdamWConfig
 from olmo_core.optim.scheduler import CosWithWarmup
 from olmo_core.train.callbacks.checkpointer import CheckpointerCallback, CheckpointRemovalStrategy
@@ -39,9 +40,17 @@ from olmo_core.utils import prepare_cli_environment, seed_all
 
 from eval.native import evaluate_in_memory
 from src.arch.core.spec import spec_to_olmo
+from src.arch.memory.olmo import (
+    EngramIdentity,
+    build_engram_model,
+    config_from_identity,
+    memory_identity,
+    validate_memory_tokenizer,
+)
 from src.data.olmo_streaming import build_official_streaming_loader
 from src.train.config import TrainSpec
 from src.train.loss import ChunkedLMHeadConfig
+from src.utils.engram_budget import budget_report_with_engram
 from src.utils.megatron_budget import BudgetPayload, budget_report
 
 from .callbacks import AttemptResult, TrainingMeter, write_json
@@ -72,6 +81,8 @@ class TrainingArguments:
     model: str = "qwen35"
     no_checkpoints: bool = False
     eval_cache: Path | None = None
+    engram_config: Path | None = None
+    engram_token_map: Path | None = None
 
 
 def arguments(argv: Sequence[str] | None = None) -> TrainingArguments:
@@ -92,8 +103,12 @@ def arguments(argv: Sequence[str] | None = None) -> TrainingArguments:
     parser.add_argument(
         "--eval-cache", type=Path, help="Prepared full A cache for post-training evaluation"
     )
+    parser.add_argument("--engram-config", type=Path, help="Experimental Engram configuration")
+    parser.add_argument("--engram-token-map", type=Path, help="Prepared vocabulary-only .npy map")
     options = TrainingArguments(**vars(parser.parse_args(argv)))
-    if options.output.exists() and int(os.environ.get("RANK", "0")) == 0:
+    if (options.engram_config is None) != (options.engram_token_map is None):
+        parser.error("Engram requires both --engram-config and --engram-token-map")
+    elif options.output.exists() and int(os.environ.get("RANK", "0")) == 0:
         parser.error("Every attempt requires a fresh output directory")
     elif options.smoke_steps is not None and not 1 <= options.smoke_steps <= 8:
         parser.error("Engineering smoke is bounded to 1..8 cumulative steps")
@@ -102,6 +117,8 @@ def arguments(argv: Sequence[str] | None = None) -> TrainingArguments:
     elif options.no_checkpoints and options.smoke_steps is None and options.eval_cache is None:
         parser.error("Checkpoint-free formal training requires --eval-cache")
     else:
+        if options.engram_config is not None:
+            options.model = "qwen35-engram"
         return options
 
 
@@ -143,10 +160,22 @@ def source_identity(*, require_clean: bool) -> tuple[str | None, dict[str, str]]
     return source, source_files
 
 
-def training_budget(budget_flops: int) -> BudgetPayload:
+def training_budget(
+    budget_flops: int, engram_identity: EngramIdentity | None = None
+) -> BudgetPayload:
     """Use the same frozen global batch for planning and actual training."""
+    backbone_config = json.loads((ROOT / "recipes/qwen35-08b/config.json").read_text())
+    if engram_identity is not None:
+        return budget_report_with_engram(
+            backbone_config,
+            engram_config=config_from_identity(engram_identity),
+            sequence_length=SEQUENCE_LENGTH,
+            batch_sequences=GLOBAL_BATCH,
+            budget=budget_flops,
+            rounding="nearest",
+        )
     return budget_report(
-        json.loads((ROOT / "recipes/qwen35-08b/config.json").read_text()),
+        backbone_config,
         sequence_length=SEQUENCE_LENGTH,
         batch_sequences=GLOBAL_BATCH,
         budget=budget_flops,
@@ -157,9 +186,21 @@ def training_budget(budget_flops: int) -> BudgetPayload:
 def main(argv: Sequence[str] | None = None) -> None:
     options = arguments(argv)
     config_path = ROOT / "recipes/qwen35-08b/config.json"
+    engram_identity = (
+        memory_identity(options.engram_config, options.engram_token_map)
+        if options.engram_config is not None and options.engram_token_map is not None
+        else None
+    )
+    if engram_identity is not None:
+        validate_memory_tokenizer(engram_identity, options.tokenizer_dir)
+    formal_training = options.smoke_steps is None and engram_identity is None
     local_batch_sequences = GLOBAL_BATCH // options.dp_world_size
     if options.plan:
-        plan = training_budget(options.budget)
+        plan = (
+            training_budget(options.budget, engram_identity)
+            if engram_identity is not None
+            else training_budget(options.budget)
+        )
         plan.update(
             world_size=2,
             local_batch_sequences=64,
@@ -167,6 +208,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             gradient_accumulation=64 // options.microbatch,
             seed=SEED,
         )
+        if engram_identity is not None:
+            plan.update(run_kind="engram_experimental", formal_training=False)
         print(json.dumps(plan, indent=2))
         return
     else:
@@ -180,12 +223,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     started_seconds = time.monotonic()
     result: AttemptResult = {
         "status": "preparing",
-        "formal_training": options.smoke_steps is None,
+        "formal_training": formal_training,
         "completed_new_updates": 0,
         "new_update_flops": 0,
         "checkpoint_saved": False,
     }
+    if engram_identity is not None:
+        result["run_kind"] = "engram_experimental"
     training_finished = False
+    budget: BudgetPayload | None = None
     if rank == 0:
         write_json(output_directory / "result.json", result)
     else:
@@ -214,7 +260,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         init_distributed(timeout=timedelta(minutes=10))
         output_directory.mkdir(parents=True, exist_ok=True)
         seed_all(SEED)
-        budget = training_budget(options.budget)
+        budget = (
+            training_budget(options.budget, engram_identity)
+            if engram_identity is not None
+            else training_budget(options.budget)
+        )
         if not budget["within_one_percent"]:
             raise ValueError("Whole optimizer steps fall outside the competition budget tolerance")
         else:
@@ -253,10 +303,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             source_commit=source,
             source_files_sha256=source_files,
             config_sha256=hashlib.sha256(config_path.read_bytes()).hexdigest(),
-            formal_training=options.smoke_steps is None,
+            formal_training=formal_training,
             checkpointing="disabled" if options.no_checkpoints else "full_native",
             evaluation_cache=str(options.eval_cache) if options.eval_cache else None,
         )
+        if engram_identity is not None:
+            settings.update(
+                run_kind="engram_experimental",
+                engram=engram_identity,
+                engram_embedding_peak_lr=5 * PEAK_LEARNING_RATE,
+                engram_embedding_weight_decay=0.0,
+                engram_initialization="independent layer-seeded normal; convolution zero",
+                logged_lr_group="Engram embedding parameters (first optimizer group)",
+                official_engram_certification="not_available",
+                ledger_basis="Megatron backbone and separate experimental Engram appendix",
+            )
         write_json(output_directory / "settings.json", settings)
         write_json(output_directory / "megatron-budget.json", budget)
         write_json(
@@ -309,6 +370,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             autocast="bfloat16",
             loss_backend="torch_chunked",
             data_parallel="ddp",
+            engram=engram_identity,
         )
         write_json(output_directory / "train.json", train_spec.to_dict())
         write_json(
@@ -318,7 +380,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 initialization="full native checkpoint" if options.resume else "random",
                 target_step=target_steps,
                 scheduler_horizon=horizon_steps,
-                formal_training=options.smoke_steps is None,
+                formal_training=formal_training,
             ),
         )
         if options.resume:
@@ -336,7 +398,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 previous_directory = previous_directory / "ranks" / f"rank{rank}"
             else:
                 pass
-            if json.loads((previous_directory / "settings.json").read_text()) != settings:
+            if engram_identity is None and (
+                json.loads((previous_directory / "settings.json").read_text()) != settings
+            ):
                 raise ValueError(
                     "Full resume requires identical frozen training settings and source commit"
                 )
@@ -357,15 +421,41 @@ def main(argv: Sequence[str] | None = None) -> None:
             dtype=DType.float32,
             chunk_tokens=CE_CHUNK_TOKENS,
         )
-        model = model_config.build(init_device="meta")
+        model = (
+            build_engram_model(model_config, engram_identity, init_device="meta")
+            if engram_identity is not None
+            else model_config.build(init_device="meta")
+        )
+        if engram_identity is not None:
+            settings["model_parameter_count"] = sum(
+                parameter.numel() for parameter in model.parameters()
+            )
+            settings["engram_parameter_count"] = sum(
+                parameter.numel()
+                for parameter_name, parameter in model.named_parameters()
+                if parameter_name.startswith("engrams.")
+            )
+            write_json(output_directory / "settings.json", settings)
+            if options.resume and (
+                json.loads((previous_directory / "settings.json").read_text()) != settings
+            ):
+                raise ValueError("Full resume requires identical Engram training settings")
         if any(parameter.dtype != torch.float32 for parameter in model.parameters()):
             raise ValueError("Expected FP32 master parameters throughout")
         else:
             pass
+        optimizer_config = AdamWConfig(lr=PEAK_LEARNING_RATE, betas=(0.9, 0.95), weight_decay=0.1)
+        if engram_identity is not None:
+            optimizer_config.group_overrides = [
+                OptimGroupOverride(
+                    params=["engrams.*.embedding.weight"],
+                    opts={"lr": 5 * PEAK_LEARNING_RATE, "weight_decay": 0.0},
+                )
+            ]
         train_module = TransformerTrainModuleConfig(
             rank_microbatch_size=options.microbatch * SEQUENCE_LENGTH,
             max_sequence_length=SEQUENCE_LENGTH,
-            optim=AdamWConfig(lr=PEAK_LEARNING_RATE, betas=(0.9, 0.95), weight_decay=0.1),
+            optim=optimizer_config,
             scheduler=CosWithWarmup(warmup=warmup_steps, t_max=horizon_steps, alpha_f=0.1),
             max_grad_norm=1.0,
             autocast_precision=DType.bfloat16,
@@ -402,10 +492,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             },
         ).build(train_module, loader)
+        ledger_update_flops = int(budget["training_flops_per_optimizer_step"])
+        if engram_identity is not None:
+            ledger_update_flops = int(
+                budget["backbone_megatron_training_flops_per_token"]
+                * GLOBAL_BATCH
+                * SEQUENCE_LENGTH
+            )
         meter = TrainingMeter(
             output_directory=output_directory,
             result=result,
-            update_flops=budget["training_flops_per_optimizer_step"],
+            update_flops=ledger_update_flops,
             loader=loader,
             train_module=train_module,
             started_seconds=started_seconds,
@@ -417,11 +514,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             trainer.load_checkpoint(
                 str(options.resume), load_trainer_state=True, load_optim_state=True
             )
+            if engram_identity is not None:
+                result["cumulative_step"] = trainer.global_step
+                result["megatron_cumulative_flops"] = meter.cumulative_flops
             write_json(output_directory / "loaded-state-digests.json", meter.state_digests())
-            if (
-                meter.cumulative_flops
-                != trainer.global_step * budget["training_flops_per_optimizer_step"]
-            ):
+            if meter.cumulative_flops != trainer.global_step * ledger_update_flops:
                 raise ValueError("Restored cumulative budget does not match global_step")
             else:
                 pass
@@ -470,6 +567,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         raise
     finally:
+        if engram_identity is not None and budget is not None:
+            completed_updates = result["completed_new_updates"]
+            backbone_update_flops = int(
+                budget["backbone_megatron_training_flops_per_token"]
+                * GLOBAL_BATCH
+                * SEQUENCE_LENGTH
+            )
+            engram_update_flops = (
+                int(budget["training_flops_per_optimizer_step"]) - backbone_update_flops
+            )
+            result["backbone_new_update_flops"] = completed_updates * backbone_update_flops
+            result["engram_experimental_new_update_flops"] = completed_updates * engram_update_flops
+            result["experimental_new_update_flops"] = (
+                result["backbone_new_update_flops"] + result["engram_experimental_new_update_flops"]
+            )
+            cumulative_step = result.get("cumulative_step", 0)
+            result["backbone_cumulative_flops"] = cumulative_step * backbone_update_flops
+            result["engram_experimental_cumulative_flops"] = cumulative_step * engram_update_flops
+            result["experimental_cumulative_flops"] = cumulative_step * (
+                backbone_update_flops + engram_update_flops
+            )
         result["wall_seconds"] = time.monotonic() - started_seconds
         if output_directory.exists():
             write_json(output_directory / "result.json", result)

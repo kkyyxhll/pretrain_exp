@@ -110,6 +110,30 @@ done
 
 完整A BPB分别为 **2.490339、2.094881、1.801403、1.428890**。结果是固定架构、配方、单seed的四点观测；没有最优架构证明、多seed误差估计或外推拟合。A有历史选型使用，结果为开发验证，正式榜单认证尚未完成。
 
+## Engram 实验配方
+
+`recipes/qwen35-engram/` 在同一 Qwen3.5 主干的第 2、16 层注意力前加入单流 Engram，复用流式 loader、DP2、分块 CE 和完整激活重计算。实现参考 [Engram 论文](https://arxiv.org/abs/2601.07372) 和固定版本的[官方示例](https://github.com/deepseek-ai/Engram/tree/fb7f84a21f91223715394a33a1dc24bbfb7f788e)；原件位于 `third_party/engram/`，只用于核对。
+
+默认使用 2/3-gram、每阶 8 个 head、每 head 64 维、每 head 约 32,768 行的独立素数表，拼接维度 1,024；卷积 kernel4、dilation3。词表归一化只影响 memory 地址，不修改训练 tokenizer、文本、标签或 BPB 分母；行首和原始 EOS 后重置 n-gram 与卷积历史。原始 EOS 出现在正文时也会重置。表参数 LR 为主干的 5 倍，weight decay=0；其余参数沿用主干配方。
+
+这是原 Engram 的单残差流适配，不包含多流 HC、RL、CPU offload 或跨设备表分片。默认 gate 使用论文的归一化点积 sigmoid，`signed_sqrt` 为官方 demo 的可选差异；卷积零初始化，表和 Key/Value 的 normal std0.02、norm epsilon1e-6 为本配方明确选择。卷积零初始化不代表整个 Engram 分支输出为零。
+
+先从固定本地 tokenizer 离线准备 vocabulary map，不读取训练语料或预训练权重。映射和 sidecar 保存在 runtime，训练前核对 backend 哈希、词表长度与 EOS/pad：
+
+```bash
+python -m recipes.qwen35-engram.prepare --tokenizer-dir "$TOKENIZER_DIR" \
+  --runtime-dir "$RUNTIME_DIR/engram-map-v1"
+export ENGRAM_TOKEN_MAP="$RUNTIME_DIR/engram-map-v1/token-map.npy"
+python -m recipes.qwen35-engram.train --budget 300000000000000000 \
+  --data-dir "$DATA_DIR" --tokenizer-dir "$TOKENIZER_DIR" \
+  --engram-token-map "$ENGRAM_TOKEN_MAP" --output "$RUNTIME_DIR/engram-plan-unused" --plan
+export RUN_DIR="$RUNTIME_DIR/engram-smoke-attempt01"
+bash recipes/qwen35-engram/train_qwen35_engram_dp2.sh 300000000000000000 \
+  --smoke-steps 2 --no-checkpoints
+```
+
+固定 Megatron 函数没有 Engram 项。`src/utils/engram_budget.py` 单列 Key/Value 与 depthwise Conv 的主要训练计算项，不按整张 embedding 表的参数量计 FLOPs；它遗漏 norm、gate、bias、SiLU、查表梯度加法等，尚不是官方认证的实际计算图账本。计划以主干参考值加该实验附录确定步数，运行始终标记 `engram_experimental`，原始 Megatron 主干累计量与实验附录分别保存。认证前不能将此模式表述为正式比赛候选。恢复仍需同一配置、map、tokenizer、源码和全部训练状态；完整 GPU 恢复是否通过以运行证据为准。
+
 ## 检查
 
 自有代码使用 Ruff 和 pre-commit 统一格式与检查；官方评估原件、vendored OLMo 和 Megatron 参考原件不格式化，以保留其身份与哈希。共享 worktree 的个人 hook 安装见 [DEVELOPING.md](DEVELOPING.md)。
@@ -126,6 +150,7 @@ python -m recipes.qwen35-08b.train --help
 ## 目录
 
 - `recipes/qwen35-08b/`：本模型训练入口、DP2启动脚本、模型配方、固定配置和本地 tokenizer 资产。
+- `recipes/qwen35-engram/`、`src/arch/memory/`：Engram 实验配置、离线映射准备、启动入口与单流组件。
 - `src/arch/`、`src/data/`、`src/train/`：模型、压缩流式数据和训练组件；数据读取所需的 tokenizer 辅助也在 `src/data/`。
 - `src/utils/megatron_budget.py`、`third_party/megatron/`：官方参考计算预算的适配器与原件。
 - `docs/`：本模型已有四档结果图与 JSONL。

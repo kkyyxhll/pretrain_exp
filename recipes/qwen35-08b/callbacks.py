@@ -44,6 +44,13 @@ class AttemptResult(TypedDict):
     final_checkpoint: NotRequired[str]
     error: NotRequired[str]
     partial_failed_update_flops: NotRequired[str]
+    run_kind: NotRequired[Literal["engram_experimental"]]
+    backbone_new_update_flops: NotRequired[int]
+    engram_experimental_new_update_flops: NotRequired[int]
+    experimental_new_update_flops: NotRequired[int]
+    backbone_cumulative_flops: NotRequired[int]
+    engram_experimental_cumulative_flops: NotRequired[int]
+    experimental_cumulative_flops: NotRequired[int]
 
 
 class LedgerState(TypedDict):

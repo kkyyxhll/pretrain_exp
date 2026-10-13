@@ -6,6 +6,8 @@
 
 训练入口：`recipes/qwen35-08b/train.py`，模型配方与固定配置也在同一目录；启动脚本：`recipes/qwen35-08b/train_qwen35_dp2.sh`。模型组件：`src/arch/`；流式压缩语料与必要 tokenizer 辅助：`src/data/`；分块 CE 与训练配置：`src/train/`；固定 Megatron 参考账本：`src/utils/megatron_budget.py`，官方原件与许可证：`third_party/megatron/`。固定 tokenizer 资产在 `recipes/qwen35-08b/tokenizer-qwen35/` 并忽略 Git。
 
+Engram 实验入口与配置在 `recipes/qwen35-engram/`，单流组件在 `src/arch/memory/`；复用同一压缩流式 loader。离线 vocabulary map 仅供 memory lookup，必须绑定实际固定 tokenizer 的 backend 哈希、词表长度和 EOS/pad。原始 Megatron 参考缺少 Engram 项，主干账本与 `src/utils/engram_budget.py` 的实验附录分开；所有 Engram 运行标记非正式 `engram_experimental`，不宣称官方 FLOPs 认证或多流 HC/RL/offload 已完成。默认论文 gate 与 demo gate 差异、初始化和 GPU 验证边界见 README.md。
+
 使用 conda 的 olmo 环境。共享机器先创建自己的 branch/worktree，并配置个人提交身份和独立 hook 路径；代码通过 PR 合并 main。Ruff/pre-commit 只检查自有代码，不改官方或 vendored 原件。正式训练从干净 commit 创建冻结的运行 worktree。每次运行新目录，保留累计 FLOPs 和失败证据；`$RUNTIME_DIR` 默认位于 `$EXP_DIR/pretrain_exp-runtime`。
 
 当前四档采用 `--no-checkpoints --eval-cache`：不保存checkpoint，训练结束直接对内存中的最终模型做完整A评估，复用训练进程组，结果在 `$RUN_DIR/eval-a/`。正式运行先准备匹配的完整A缓存；无checkpoint模式不允许resume，中断需从随机初始化重跑该档，失败成本仍保留。可选checkpoint模式继续支持完整状态恢复与累计FLOPs。
