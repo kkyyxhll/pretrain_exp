@@ -16,6 +16,7 @@ from torch.distributed.checkpoint import load
 from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
 
 from src.arch.core.spec import spec_to_olmo
+from src.arch.memory.olmo import build_engram_model
 from src.data.olmo_streaming import TokenizerIdentity
 from src.train.config import TrainSpec
 from src.train.loss import ChunkedLMHeadConfig
@@ -185,6 +186,8 @@ def load_model(options: EvaluateOptions, device: torch.device) -> tuple[Transfor
         raise ValueError("Training specifications must be mappings")
     elif saved_spec_data["arch"] != spec_data["arch"]:
         raise ValueError("evaluation architecture differs from the saved training spec")
+    elif saved_spec_data.get("engram") != spec_data.get("engram"):
+        raise ValueError("evaluation Engram identity differs from the saved training spec")
     else:
         training_spec = TrainSpec.from_dict(spec_data)
     if options.precision == "fp32-master-bf16" and training_spec.autocast != "bfloat16":
@@ -197,7 +200,11 @@ def load_model(options: EvaluateOptions, device: torch.device) -> tuple[Transfor
         dtype=model_config.lm_head.dtype,
         chunk_tokens=options.loss_chunk_tokens,
     )
-    model = model_config.build(init_device="cpu")
+    model = (
+        build_engram_model(model_config, training_spec.engram, init_device="cpu")
+        if training_spec.engram is not None
+        else model_config.build(init_device="cpu")
+    )
     if options.precision == "fp32-master-bf16":
         # note (kkyyxhll): Checkpoint loading uses destination dtype, so promotion must precede it.
         model.float()

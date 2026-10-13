@@ -1,0 +1,15 @@
+{
+  "layer_ids": [1, 15],
+  "table_sizes": [32768, 32768],
+  "max_ngram_size": 3,
+  "heads": 8,
+  "head_dim": 64,
+  "kernel_size": 4,
+  "dilation": 3,
+  "seed": 20261011,
+  "pad_id": 248044,
+  "eos_id": 248044,
+  "gate_variant": "dot",
+  "norm_eps": 1e-6,
+  "init_std": 0.02
+}

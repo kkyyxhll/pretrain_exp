@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 from src.arch.core.spec import ArchPayload, ArchSpec
+from src.arch.memory.olmo import EngramIdentity, config_from_identity
 from src.data.olmo_streaming import LoaderIdentity
 
 __all__ = ["TrainSpec", "TrainSpecError"]
@@ -23,7 +24,16 @@ class TrainingDataPayload(TypedDict):
 
 
 TrainPayload = dict[
-    str, ArchPayload | TrainingDataPayload | str | int | float | bool | list[float] | None
+    str,
+    ArchPayload
+    | TrainingDataPayload
+    | EngramIdentity
+    | str
+    | int
+    | float
+    | bool
+    | list[float]
+    | None,
 ]
 
 
@@ -56,8 +66,28 @@ class TrainSpec:
     loss_chunk_tokens: int = 1024
     training_bpb_manifest: str | None = None
     activation_checkpointing: Literal["full", "none"] = "full"
+    engram: EngramIdentity | None = None
 
     def __post_init__(self) -> None:
+        if self.engram is not None:
+            required_fields = {"config", "token_map_path", "token_map_sha256"}
+            allowed_fields = required_fields | {"tokenizer_backend_sha256"}
+            if (
+                not isinstance(self.engram, dict)
+                or not required_fields <= self.engram.keys()
+                or self.engram.keys() - allowed_fields
+            ):
+                raise TrainSpecError("Engram needs configuration, token map path, and SHA256")
+            for name in ("token_map_path", "token_map_sha256"):
+                if not isinstance(self.engram[name], str) or not self.engram[name]:
+                    raise TrainSpecError(f"Engram {name} must be a nonempty string")
+            checksum = self.engram["token_map_sha256"]
+            if len(checksum) != 64 or any(c not in "0123456789abcdef" for c in checksum):
+                raise TrainSpecError("Engram token map SHA256 must be a lowercase hex digest")
+            try:
+                config_from_identity(self.engram)
+            except (TypeError, ValueError) as error:
+                raise TrainSpecError(f"Invalid Engram configuration: {error}") from error
         for setting_name, setting_value in (
             ("rank_microbatch_size", self.rank_microbatch_size),
             ("max_steps", self.max_steps),
@@ -105,6 +135,8 @@ class TrainSpec:
         """Serialize the existing fields while preserving raw architecture and data payloads."""
         training_payload = dataclasses.asdict(self)
         training_payload["betas"] = list(self.betas)
+        if self.engram is None:
+            training_payload.pop("engram")
         return training_payload
 
     def to_json(self) -> str:

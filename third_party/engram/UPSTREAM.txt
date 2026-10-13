@@ -1,0 +1,4 @@
+Source: https://github.com/deepseek-ai/Engram
+Commit: fb7f84a21f91223715394a33a1dc24bbfb7f788e
+Original path: engram_demo_v1.py
+Reference only; Attention/MoE/HC in this demo are mocked and are not used by the training recipe.
